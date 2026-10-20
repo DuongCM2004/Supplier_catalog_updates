@@ -107,8 +107,16 @@ func (m *Manager) Resume(ctx context.Context, jobID string) (Job, error) {
 	}
 	m.log.Info("job.transition", "job_id", jobID, "update_id", prev.UpdateID,
 		"from", prev.Status, "to", StatusRunning, "reason", "resumed")
+	// The snapshot is read before the worker exists, so it is the RUNNING state this call
+	// created. Reading after spawn would let a fast worker finish, park or interrupt the job
+	// first and make the caller see the outcome of the run instead of its start.
+	snapshot, readErr := GetJob(ctx, m.pool, jobID)
+	// The job is RUNNING in the database now, so it needs its worker even if the read failed.
 	m.spawn(jobID)
-	return GetJob(ctx, m.pool, jobID)
+	if readErr != nil {
+		return Job{}, readErr
+	}
+	return snapshot, nil
 }
 
 // awaitWorkerExit is called with m.mu held and returns with it held. A worker that has

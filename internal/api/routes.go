@@ -24,13 +24,24 @@ type Deps struct {
 	APIToken   string           // when set, POST routes require "Authorization: Bearer <token>"
 }
 
-// NewRouter returns the full HTTP handler: every route wrapped in request logging.
+// NewRouter returns the full HTTP handler: every route wrapped in request logging. Only the
+// two POST routes, the ones that change state, are behind the bearer token; reads stay
+// public so a deployment can be inspected without credentials. The token check wraps the
+// handler itself, so a rejected request is answered 401 before its body is read.
 func NewRouter(d Deps) http.Handler {
 	if d.Log == nil {
 		d.Log = slog.Default()
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", d.healthz)
+	mux.Handle("POST /api/syncs", RequireToken(d.APIToken, http.HandlerFunc(d.startSync)))
+	mux.HandleFunc("GET /api/syncs", d.listSyncs)
+	mux.HandleFunc("GET /api/syncs/{id}", d.getSync)
+	mux.Handle("POST /api/syncs/{id}/resume", RequireToken(d.APIToken, http.HandlerFunc(d.resumeSync)))
+	mux.HandleFunc("GET /api/syncs/{id}/changes", d.listChanges)
+	mux.HandleFunc("GET /api/syncs/{id}/issues", d.listIssues)
+	mux.HandleFunc("GET /api/products", d.listProducts)
+	mux.HandleFunc("GET /api/products/{product_id}", d.getProduct)
 	return d.requestLog(mux)
 }
 

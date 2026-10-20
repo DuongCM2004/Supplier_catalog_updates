@@ -3,11 +3,14 @@ package syncjob
 import (
 	"context"
 	"errors"
+	"os"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/DuongCM2004/resilient-catalog-sync/internal/supplier"
@@ -414,4 +417,138 @@ func TestResumeAfterEndOfFeedOnlyRunsTheCompletionCheck(t *testing.T) {
 	if calls := sup.Calls(); len(calls) != 0 {
 		t.Fatalf("supplier was called %v; a job past end of feed must never ask it anything", calls)
 	}
+}
+
+// lateReadKey marks the context of the one Resume call whose reads lateReadTracer delays.
+type lateReadKey struct{}
+
+// resumeReadPatience bounds how long the delayed read waits for a worker that never comes.
+const resumeReadPatience = 500 * time.Millisecond
+
+// lateReadTracer models a slow database read inside Resume: the read that follows the
+// RUNNING transition is held back until the job has left RUNNING (which only a worker that
+// already started can cause) or resumeReadPatience has passed. With the worker started
+// before that read, the caller therefore sees the outcome of the run; with the read taken
+// before the worker exists, nothing can change the job and the wait just times out.
+type lateReadTracer struct {
+	watcher *pgxpool.Pool // not traced, so watching the job does not delay itself
+	jobID   string
+	cancel  context.CancelFunc // when set, the delayed read fails instead: its context is cancelled
+	mu      sync.Mutex
+	reads   int
+}
+
+func (tr *lateReadTracer) TraceQueryStart(ctx context.Context, _ *pgx.Conn, data pgx.TraceQueryStartData) context.Context {
+	if ctx.Value(lateReadKey{}) == nil || data.SQL != sqlGetJob {
+		return ctx
+	}
+	tr.mu.Lock()
+	tr.reads++
+	n := tr.reads
+	tr.mu.Unlock()
+	if n != 2 { // 1st: Resume checks the previous state; 2nd: the read after the transition
+		return ctx
+	}
+	if tr.cancel != nil {
+		tr.cancel()
+		return ctx
+	}
+	// Polling here is a bounded delay that stands in for a slow query; nothing is
+	// synchronised on it, the assertion is on what Resume returns.
+	for deadline := time.Now().Add(resumeReadPatience); time.Now().Before(deadline); time.Sleep(2 * time.Millisecond) {
+		var status string
+		err := tr.watcher.QueryRow(context.Background(), `SELECT status FROM sync_jobs WHERE id = $1::uuid`, tr.jobID).Scan(&status)
+		if err != nil || (status != string(StatusRunning) && status != string(StatusPending)) {
+			break
+		}
+	}
+	return ctx
+}
+
+func (tr *lateReadTracer) TraceQueryEnd(context.Context, *pgx.Conn, pgx.TraceQueryEndData) {}
+
+// mgrTracedManager is a Manager on its own pool whose reads lateReadTracer can delay.
+func mgrTracedManager(t *testing.T, watcher *pgxpool.Pool, sup supplier.Client) (*Manager, *pgxpool.Pool, *lateReadTracer) {
+	t.Helper()
+	cfg, err := pgxpool.ParseConfig(os.Getenv("TEST_DATABASE_URL"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tracer := &lateReadTracer{watcher: watcher}
+	cfg.ConnConfig.Tracer = tracer
+	pool, err := pgxpool.NewWithConfig(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close) // registered before the Manager's shutdown, so it runs after it
+	return mgrNewManager(t, pool, sup, fastRetryConfig(), Hooks{}), pool, tracer
+}
+
+func TestResumeReturnsTheRunningSnapshotEvenWhenTheWorkerFinishesFirst(t *testing.T) {
+	watcher := testutil.DB(t)
+	resumeCtx := context.WithValue(context.Background(), lateReadKey{}, true)
+
+	t.Run("job already past the end of the feed", func(t *testing.T) {
+		testutil.Reset(t, watcher)
+		m, _, tracer := mgrTracedManager(t, watcher, testutil.NewFakeSupplier())
+		// Nothing is left to fetch, so the worker only runs the completion check.
+		id := storeSeedJob(t, watcher, "UPDATE-1", StatusNeedsAttention)
+		if _, err := watcher.Exec(context.Background(), `UPDATE sync_jobs SET end_of_feed_seen = true, processed_batches = 1, total_batches = 1 WHERE id = $1::uuid`, id); err != nil {
+			t.Fatal(err)
+		}
+		tracer.jobID = id
+
+		job, err := m.Resume(resumeCtx, id)
+		if err != nil || job.ID != id || job.Status != StatusRunning {
+			t.Fatalf("Resume = %s, %v; want the job RUNNING, as the transition left it", job.Status, err)
+		}
+		m.Wait()
+		if got := mgrJob(t, watcher, id); got.Status != StatusCompleted {
+			t.Fatalf("job ended %s, want COMPLETED", got.Status)
+		}
+	})
+
+	t.Run("one-batch feed resumed after an outage", func(t *testing.T) {
+		testutil.Reset(t, watcher)
+		sup := testutil.NewFakeSupplier()
+		sup.SetUpdate(testutil.Info("UPDATE-1", 1))
+		sup.AddPage("", testutil.Page("UPDATE-1", "BATCH-1", "", false, testutil.Active("SKU-1", 1, "Widget", 100)))
+		sup.FailTimes("", -1)
+		m, _, tracer := mgrTracedManager(t, watcher, sup)
+		started := mgrStart(t, m, "UPDATE-1")
+		m.Wait() // supplier unavailable: INTERRUPTED before any batch
+		sup.FailTimes("", 0)
+		tracer.jobID = started.ID
+
+		job, err := m.Resume(resumeCtx, started.ID)
+		if err != nil || job.ID != started.ID || job.Status != StatusRunning {
+			t.Fatalf("Resume = %s, %v; want the job RUNNING, as the transition left it", job.Status, err)
+		}
+		m.Wait()
+		if got := mgrJob(t, watcher, started.ID); got.Status != StatusCompleted || got.ProcessedBatches != 1 {
+			t.Fatalf("job ended %s with %d batches, want COMPLETED with 1", got.Status, got.ProcessedBatches)
+		}
+	})
+
+	t.Run("snapshot read fails", func(t *testing.T) {
+		testutil.Reset(t, watcher)
+		m, _, tracer := mgrTracedManager(t, watcher, testutil.NewFakeSupplier())
+		id := storeSeedJob(t, watcher, "UPDATE-1", StatusNeedsAttention)
+		if _, err := watcher.Exec(context.Background(), `UPDATE sync_jobs SET end_of_feed_seen = true, processed_batches = 1, total_batches = 1 WHERE id = $1::uuid`, id); err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithCancel(resumeCtx)
+		defer cancel()
+		tracer.jobID, tracer.cancel = id, cancel
+
+		// The job is already RUNNING in the database, so it must still get its worker; the
+		// caller learns that the answer could not be read.
+		if job, err := m.Resume(ctx, id); !errors.Is(err, context.Canceled) {
+			t.Fatalf("Resume = %s, %v; want the read error", job.Status, err)
+		}
+		m.Wait()
+		if got := mgrJob(t, watcher, id); got.Status != StatusCompleted {
+			t.Fatalf("job ended %s, want COMPLETED: the worker must run although the read failed", got.Status)
+		}
+	})
 }
