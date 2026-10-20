@@ -374,3 +374,44 @@ func TestWorkerPanicIsContainedAndLeavesTheJobResumable(t *testing.T) {
 	healthy.Wait()
 	mgrAssertCompleted(t, pool, started.ID)
 }
+
+func TestResumeAfterEndOfFeedOnlyRunsTheCompletionCheck(t *testing.T) {
+	pool := testutil.DB(t)
+	testutil.Reset(t, pool)
+	sup := testutil.NewFakeSupplier() // serves nothing: any call to it would be a bug and fail the job
+	m := mgrNewManager(t, pool, sup, fastRetryConfig(), Hooks{})
+	ctx := context.Background()
+
+	// A job whose last batch was committed while a blocking problem from an earlier cursor
+	// was still open, plus an outage note left behind by a failed attempt.
+	id := storeSeedJob(t, pool, "UPDATE-1", StatusNeedsAttention)
+	if _, err := pool.Exec(ctx, `UPDATE sync_jobs SET end_of_feed_seen = true, processed_batches = 3, total_batches = 3 WHERE id = $1::uuid`, id); err != nil {
+		t.Fatal(err)
+	}
+	storeRecord(t, pool, storeIssue(id, CodeInvalidProductData, SeverityBlocking, "cursor-2"))
+	storeRecord(t, pool, storeIssue(id, CodeSupplierUnavailable, SeverityTransient, "cursor-3"))
+
+	mgrResume(t, m, id)
+	m.Wait()
+	job := mgrJob(t, pool, id)
+	if job.Status != StatusNeedsAttention || job.OpenBlockingIssues != 1 || job.LastError == nil {
+		t.Fatalf("with a blocking issue open: %s, open blocking %d, last_error %v; want NEEDS_ATTENTION, 1, a reason", job.Status, job.OpenBlockingIssues, job.LastError)
+	}
+	for _, iss := range storeIssueRows(t, pool, id) {
+		if wantResolved := iss.Severity == string(SeverityTransient); (iss.Status == "RESOLVED") != wantResolved {
+			t.Fatalf("issue %+v: the check should close the transient note and keep the blocking issue open", iss)
+		}
+	}
+
+	if _, err := pool.Exec(ctx, `UPDATE sync_issues SET status = 'RESOLVED', resolved_at = now() WHERE severity = 'BLOCKING'`); err != nil {
+		t.Fatal(err)
+	}
+	mgrResume(t, m, id)
+	m.Wait()
+	if job := mgrJob(t, pool, id); job.Status != StatusCompleted || job.CompletedAt == nil || job.LastError != nil {
+		t.Fatalf("with nothing open: %s, completed_at %v, last_error %v; want COMPLETED", job.Status, job.CompletedAt, job.LastError)
+	}
+	if calls := sup.Calls(); len(calls) != 0 {
+		t.Fatalf("supplier was called %v; a job past end of feed must never ask it anything", calls)
+	}
+}

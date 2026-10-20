@@ -203,6 +203,9 @@ func (m *Manager) finalize(ctx context.Context, jobID string) error {
 		if err != nil || j.Status != StatusRunning {
 			return err
 		}
+		if err := resolveTransientIssues(ctx, tx, jobID); err != nil {
+			return err
+		}
 		open, err := countOpenBlocking(ctx, tx, jobID)
 		if err != nil {
 			return err

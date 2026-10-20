@@ -688,3 +688,25 @@ func storeResetJobs(t *testing.T, pool *pgxpool.Pool) {
 		t.Fatal(err)
 	}
 }
+
+func TestResolveTransientIssuesClosesOnlyTransientOnes(t *testing.T) {
+	pool := storeTestPool(t)
+	job := storeMustCreate(t, pool, "UPDATE-1")
+	storeRecord(t, pool, storeIssue(job.ID, CodeSupplierUnavailable, SeverityTransient, "cursor-003"))
+	storeRecord(t, pool, storeIssue(job.ID, CodeInvalidBatch, SeverityBlocking, "cursor-003"))
+
+	storeInJobTx(t, pool, job.ID, func(ctx context.Context, tx pgx.Tx) error { return resolveTransientIssues(ctx, tx, job.ID) })
+
+	for _, row := range storeIssueRows(t, pool, job.ID) {
+		switch row.Severity {
+		case string(SeverityTransient):
+			if row.Status != "RESOLVED" || !row.Resolved {
+				t.Errorf("transient issue = %+v, want RESOLVED with resolved_at", row)
+			}
+		case string(SeverityBlocking):
+			if row.Status != "OPEN" {
+				t.Errorf("blocking issue = %+v, want it left OPEN even at the same cursor", row)
+			}
+		}
+	}
+}

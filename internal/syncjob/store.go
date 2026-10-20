@@ -307,6 +307,20 @@ func resolveIssues(ctx context.Context, tx pgx.Tx, jobID, cursor string) error {
 	return nil
 }
 
+const sqlResolveTransientIssues = `UPDATE sync_issues SET status = 'RESOLVED', resolved_at = now()
+	WHERE job_id = $1::uuid AND status = 'OPEN' AND severity = 'TRANSIENT'`
+
+// resolveTransientIssues closes every open transient problem of the job, for runs that
+// finish without committing a batch (the completion check after end of feed): the database
+// answered, so a recorded outage is over. Blocking issues are never closed this way. Callers
+// hold the job row lock in tx.
+func resolveTransientIssues(ctx context.Context, tx pgx.Tx, jobID string) error {
+	if _, err := tx.Exec(ctx, sqlResolveTransientIssues, jobID); err != nil {
+		return fmt.Errorf("resolve transient issues for job %s: %w", jobID, err)
+	}
+	return nil
+}
+
 const sqlCountOpenBlocking = `SELECT count(*) FROM sync_issues WHERE job_id = $1::uuid AND status = 'OPEN' AND severity = 'BLOCKING'`
 
 // countOpenBlocking is the number of unresolved issues that forbid COMPLETED. It is only
