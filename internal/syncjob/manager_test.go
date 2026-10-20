@@ -3,6 +3,7 @@ package syncjob
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"os"
 	"slices"
@@ -16,6 +17,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/DuongCM2004/resilient-catalog-sync/internal/catalog"
 	"github.com/DuongCM2004/resilient-catalog-sync/internal/supplier"
 	"github.com/DuongCM2004/resilient-catalog-sync/internal/testutil"
 )
@@ -739,5 +741,33 @@ func TestBatchWithUnstorableTextBlocksTheJobAsInvalidBatch(t *testing.T) {
 				t.Errorf("issue = %+v, want a BLOCKING INVALID_BATCH (batch id recorded: %v)", iss, tc.wantBatchID)
 			}
 		})
+	}
+}
+
+// A page larger than the ceiling is the supplier's malformed batch. It must be refused
+// before the batch transaction starts, so none of its products touch the catalog.
+func TestOversizedBatchBlocksTheJobBeforeAnyProductIsWritten(t *testing.T) {
+	env := mgrSetup(t, Hooks{})
+	products := make([]catalog.SupplierProduct, maxBatchProducts+1)
+	for i := range products {
+		products[i] = testutil.Active(fmt.Sprintf("BULK-%d", i), 1, "Widget", 100)
+	}
+	env.sup.AddPage("cursor-2", testutil.Page(mgrUpdate, "BATCH-2", "cursor-3", true, products...))
+	job := mgrStart(t, env.m, mgrUpdate)
+	env.m.Wait()
+
+	after := mgrJob(t, env.pool, job.ID)
+	if after.Status != StatusNeedsAttention || after.ProcessedBatches != 1 || after.NextCursor != "cursor-2" {
+		t.Fatalf("job = %s, %d batches, next %q; want NEEDS_ATTENTION after 1 batch at cursor-2", after.Status, after.ProcessedBatches, after.NextCursor)
+	}
+	if n := storeCount(t, env.pool, `SELECT count(*) FROM products`); n != 2 {
+		t.Errorf("products = %d, want the 2 of the first batch only", n)
+	}
+	issues, err := ListIssues(context.Background(), env.pool, job.ID, "", "", 50, 0)
+	if err != nil || len(issues) != 1 {
+		t.Fatalf("issues = %+v, err %v; want exactly one", issues, err)
+	}
+	if iss := issues[0]; iss.Code != CodeInvalidBatch || iss.Severity != SeverityBlocking || !strings.Contains(iss.Message, "1001 products") {
+		t.Errorf("issue = %+v, want a BLOCKING INVALID_BATCH that names the 1001 products", iss)
 	}
 }

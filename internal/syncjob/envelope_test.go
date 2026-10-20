@@ -2,6 +2,7 @@ package syncjob
 
 import (
 	"encoding/json"
+	"fmt"
 	"testing"
 
 	"github.com/DuongCM2004/resilient-catalog-sync/internal/catalog"
@@ -27,6 +28,14 @@ func envBatch() supplier.Batch {
 	}
 }
 
+func envProducts(n int) []catalog.SupplierProduct {
+	products := make([]catalog.SupplierProduct, n)
+	for i := range products {
+		products[i] = envProduct(fmt.Sprintf("SKU-%d", i), 1)
+	}
+	return products
+}
+
 func TestValidateEnvelopeRules(t *testing.T) {
 	const requested = "cursor-002"
 	job := Job{ID: "job-1", SupplierID: "SUP-001", UpdateID: "UPDATE-1"}
@@ -50,6 +59,8 @@ func TestValidateEnvelopeRules(t *testing.T) {
 		{"invalid UTF-8 in batch id", func(b *supplier.Batch) { b.BatchID = "BATCH-\xff2" }, CodeInvalidBatch},
 		{"NUL byte in next cursor", func(b *supplier.Batch) { b.NextCursor = "cursor\x00003" }, CodeInvalidBatch},
 		{"invalid UTF-8 in next cursor", func(b *supplier.Batch) { b.NextCursor = "cursor-\xc3" }, CodeInvalidBatch},
+		{"as many products as one batch may carry", func(b *supplier.Batch) { b.Products = envProducts(maxBatchProducts) }, ""},
+		{"one product more than one batch may carry", func(b *supplier.Batch) { b.Products = envProducts(maxBatchProducts + 1) }, CodeInvalidBatch},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

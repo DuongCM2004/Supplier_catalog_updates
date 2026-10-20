@@ -54,9 +54,15 @@ func blockErr(code IssueCode, format string, args ...any) error {
 	return &blockingErr{issue: Issue{Code: code, Severity: SeverityBlocking, Message: fmt.Sprintf(format, args...)}}
 }
 
+// maxBatchProducts is the most products one batch may carry. The batch transaction makes a
+// database round trip per product and per change row while it holds the job row and the
+// product rows locked, so an oversized page would hold them for as long as it takes to
+// send. Pipelining the statements (pgx.Batch) or COPY is the way to raise this ceiling.
+const maxBatchProducts = 1000
+
 // validateEnvelope checks everything about a batch that can be judged without the database:
-// that it belongs to the job's update, names itself, carries the end-of-feed marker and has
-// a cursor that fits that marker. requestedCursor is the cursor the batch was fetched with.
+// that it belongs to the job's update, names itself, is not larger than maxBatchProducts,
+// carries the end-of-feed marker and has a cursor that fits that marker. requestedCursor is the cursor the batch was fetched with.
 // A nil result means the envelope is sound; otherwise the BLOCKING issue to record.
 //
 // A batch that points back at the cursor it was fetched with would be fetched again
@@ -79,6 +85,8 @@ func validateEnvelope(job Job, requestedCursor string, b supplier.Batch) *Issue 
 		return invalid(CodeInvalidBatch, "batch_id %.80q is not valid text: it has a NUL byte or invalid UTF-8", b.BatchID)
 	case !cleanText(b.NextCursor):
 		return invalid(CodeInvalidBatch, "batch %.80q has a next_cursor that is not valid text: it has a NUL byte or invalid UTF-8 (%.80q)", b.BatchID, b.NextCursor)
+	case len(b.Products) > maxBatchProducts:
+		return invalid(CodeInvalidBatch, "batch %.80q has %d products, more than the %d one batch may carry", b.BatchID, len(b.Products), maxBatchProducts)
 	case b.HasMore == nil:
 		return invalid(CodeInvalidBatch, "batch %.80q has no has_more marker, so the end of the feed cannot be told", b.BatchID)
 	case *b.HasMore && b.NextCursor == "":
