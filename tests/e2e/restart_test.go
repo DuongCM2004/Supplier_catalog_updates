@@ -34,7 +34,7 @@ const (
 	updateID = "UPDATE-2026-003"
 
 	startWait = 20 * time.Second // a cold Go binary can be slow to start on a loaded machine
-	exitWait  = 20 * time.Second // the server's own graceful stop takes up to 10s + 10s
+	exitWait  = 20 * time.Second // the server's own graceful stop takes at most 8s (HTTP drain and workers share that one limit)
 	// resumeWait is how long a resumed job may take to finish the remaining batches.
 	resumeWait = 10 * time.Second
 )
