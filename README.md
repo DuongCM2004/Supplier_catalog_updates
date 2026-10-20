@@ -9,7 +9,53 @@ supplier really signalled the end of the feed and no blocking problem is open.
 
 ## 1. Description and architecture
 
-(Architecture diagram and a short walk through one sync, added after the API lands.)
+The service is a modular monolith: one Go process (HTTP API, job manager and sync workers in
+the same binary) and one PostgreSQL database. Everything that must survive, the catalog and
+the progress of every sync, lives in PostgreSQL, so the process can be killed and started
+again at any moment without losing track of where it was.
+
+```mermaid
+flowchart TB
+  staff["Staff / curl"] -->|"JSON over HTTP"| api
+  subgraph app["Go service (single instance)"]
+    api["api: routes and handlers<br/>request log"]
+    mgr["syncjob.Manager<br/>start, resume, reconcile, shutdown"]
+    wrk["worker: one goroutine per running job<br/>bounded retry with backoff"]
+    prc["Processor<br/>one transaction per batch"]
+    cat["catalog<br/>validate, revision rules, apply"]
+    sup["supplier: fixture client<br/>demo failure switches"]
+    api --> mgr --> wrk
+    wrk --> sup
+    wrk --> prc --> cat
+  end
+  sup --> fx[("fixtures/*.json")]
+  prc --> pg
+  cat --> pg
+  api -->|"read queries"| pg
+  pg[("PostgreSQL 17<br/>products, sync_jobs, sync_batches,<br/>sync_changes, sync_issues")]
+```
+
+**One transaction per batch.** The worker fetches a batch from the supplier outside any
+transaction, so a slow supplier never holds database locks. It then applies the whole batch in
+a single PostgreSQL transaction: the revision rules change the catalog, and the audit rows,
+the batch marker, the job counters and the next cursor are written in that same transaction,
+so all of it is saved or none of it is.
+
+**Six guarantees**, enforced in code and, where it matters, again by the database itself:
+
+1. **Repeats change nothing.** Starting the same update twice, receiving a batch again or
+   receiving the same record again never changes the catalog or the counters a second time.
+2. **Revisions only go up.** A product's stored revision never decreases; an older revision
+   that arrives late is counted as stale and ignored.
+3. **Withdrawn stays withdrawn.** A withdrawal is kept as a tombstone (even for a product the
+   catalog never saw) and no later event brings the product back.
+4. **A batch is applied whole or not at all.** A crash or a bad record cannot leave catalog
+   changes without their progress record, or progress without its changes.
+5. **Progress survives failures.** After a supplier outage, a crash or a restart, a job
+   continues from its saved cursor and ends with the same result as a run without failures.
+6. **Completed means completed.** A job is COMPLETED only when the supplier signalled the end
+   of the feed, every batch was committed and no blocking problem is open. A timeout or a
+   missing end marker never counts as success.
 
 ## 2. Run it
 
@@ -149,8 +195,160 @@ UTF-8 in text), then applied all-or-nothing in product-key order under row locks
 concurrent writers cannot deadlock. PostgreSQL triggers independently refuse any revision
 decrease or reactivation, so the rules also hold against manual SQL.
 
-(Request and response examples for starting a sync, reading its status, resuming it and
-listing products, changes and issues, added after the API lands.)
+### Job states
+
+| Status | Meaning | What you can do |
+|---|---|---|
+| `PENDING` | the job exists and its worker is starting | wait |
+| `RUNNING` | a worker is fetching and applying batches | wait |
+| `COMPLETED` | the supplier signalled the end of the feed, every batch is committed, no blocking issue is open | nothing, it is final |
+| `NEEDS_ATTENTION` | a batch was refused (conflicting revisions, invalid record, broken cursor chain, ...); none of that batch was applied and the issue says why | fix the data at the supplier, then resume |
+| `INTERRUPTED` | the supplier stayed unavailable after the retries, PostgreSQL had trouble, or the service was stopped or restarted | resume |
+| `FAILED` | the supplier does not know that update | nothing, it is final |
+
+Only one job is active (`PENDING` or `RUNNING`) at a time. Starting a different update while one
+is active is refused with `409`; starting an update that already has a job returns that job
+and never restarts it. Recovery is always an explicit `POST .../resume`.
+
+### Calling the API
+
+The examples use the compose default `http://localhost:8088`; use your `APP_PORT`, or the
+Render URL, instead. Reads (`GET`) never need a token. The two `POST` routes need
+`Authorization: Bearer <API_TOKEN>` only when the server runs with `API_TOKEN` set (always on
+Render, empty in the default local setup); the header variant is shown with each `POST`.
+Identifiers and timestamps below differ on every run. Responses are compact JSON; they are
+reformatted here.
+
+```bash
+BASE=http://localhost:8088
+AUTH=(-H "Authorization: Bearer $API_TOKEN")     # only when the server has API_TOKEN set
+```
+
+**Start a sync.** `202 Accepted` with a `Location` header for a new update, `200 OK` with the
+existing job when the update is already known.
+
+```bash
+curl -i -X POST $BASE/api/syncs -H 'Content-Type: application/json' \
+  -d '{"update_id":"UPDATE-2026-001"}'
+# with a token:
+curl -i -X POST $BASE/api/syncs "${AUTH[@]}" -H 'Content-Type: application/json' \
+  -d '{"update_id":"UPDATE-2026-001"}'
+```
+
+```text
+HTTP/1.1 202 Accepted
+Location: /api/syncs/4dda37ad-86f1-41ef-9447-62f0b51512a2
+Content-Type: application/json
+
+{"job_id":"4dda37ad-86f1-41ef-9447-62f0b51512a2","status":"PENDING","supplier_id":"SUP-001","supplier_update_id":"UPDATE-2026-001", ...}
+```
+
+The optional `"supplier_id"` field selects another supplier (default `SUP-001`). Ids may use
+`A-Z a-z 0-9 . _ -`, up to 64 characters.
+
+**Follow it.** A job is the unit you poll:
+
+```bash
+curl $BASE/api/syncs/4dda37ad-86f1-41ef-9447-62f0b51512a2
+curl "$BASE/api/syncs?status=INTERRUPTED&limit=20"     # newest first; limit 1-500 (default 50), offset >= 0
+```
+
+```json
+{
+  "job_id": "4dda37ad-86f1-41ef-9447-62f0b51512a2",
+  "status": "COMPLETED",
+  "supplier_id": "SUP-001",
+  "supplier_update_id": "UPDATE-2026-001",
+  "progress": { "processed_batches": 3, "total_batches": 3, "next_cursor": "",
+                "last_batch_id": "BATCH-003", "end_of_feed_seen": true },
+  "changes": { "created": 5, "updated": 2, "withdrawn": 2 },
+  "ignored": { "duplicate": 0, "stale": 0 },
+  "open_blocking_issues": 0,
+  "last_error": null,
+  "created_at": "2026-10-20T15:18:02.553403Z",
+  "started_at": "2026-10-20T15:18:02.610623Z",
+  "completed_at": "2026-10-20T15:18:02.810894Z",
+  "updated_at": "2026-10-20T15:18:02.810894Z"
+}
+```
+
+`total_batches` is `null` until the supplier says how many batches to expect, and
+`next_cursor` is the saved position a resume continues from. `ignored` counts records that were
+recognised as repeats or as older revisions and therefore changed nothing.
+
+**What changed, and what went wrong.**
+
+```bash
+curl "$BASE/api/syncs/<job_id>/changes?type=WITHDRAWN"   # type: CREATED | UPDATED | WITHDRAWN
+curl "$BASE/api/syncs/<job_id>/issues?status=OPEN"       # status: OPEN | RESOLVED; severity: BLOCKING | TRANSIENT
+```
+
+Each change carries the product's state `before` and `after` (`before` is `null` for a product
+that did not exist). The issues of `UPDATE-2026-004`, whose second batch has a negative price:
+
+```json
+{
+  "items": [
+    { "id": "baaace6e-653f-43a7-9f1f-96e3cad44482", "batch_id": "BATCH-002", "cursor": "cursor-002",
+      "supplier_id": null, "product_id": null,
+      "code": "INVALID_PRODUCT_DATA", "severity": "BLOCKING", "status": "OPEN",
+      "message": "invalid product data: SKU-302: price_minor must be >= 0", "retry_count": 0,
+      "first_seen_at": "2026-10-20T15:18:23.489791Z", "last_seen_at": "2026-10-20T15:18:23.489791Z",
+      "resolved_at": null }
+  ],
+  "open_blocking": 1
+}
+```
+
+`open_blocking` is the job's number of open blocking issues; it ignores the filters and the
+paging. It is what keeps a job out of `COMPLETED`.
+
+**Resume a stopped job** (`INTERRUPTED` or `NEEDS_ATTENTION`) from its saved cursor. It answers
+`202` with the same job, now `RUNNING`; batches that are already committed are not fetched
+again.
+
+```bash
+curl -i -X POST $BASE/api/syncs/<job_id>/resume
+curl -i -X POST $BASE/api/syncs/<job_id>/resume "${AUTH[@]}"      # with a token
+```
+
+**Browse the catalog.** `status` is `ACTIVE` (default), `WITHDRAWN` or `ALL`; `supplier_id` is
+optional. Withdrawn products are kept as tombstones and a single product can always be fetched:
+
+```bash
+curl "$BASE/api/products?status=ALL&limit=100"
+curl $BASE/api/products/SKU-103
+```
+
+```json
+{ "supplier_id": "SUP-001", "product_id": "SKU-103", "status": "WITHDRAWN", "revision": 2,
+  "name": "Camping Lantern", "price_minor": 3200, "currency": "USD",
+  "created_at": "2026-10-20T15:18:02.6418Z", "updated_at": "2026-10-20T15:18:02.810894Z",
+  "withdrawn_at": "2026-10-20T15:18:02.810894Z" }
+```
+
+A product that was withdrawn before the catalog ever saw it (`SKU-900` in
+`UPDATE-2026-001`) is a tombstone with `name`, `price_minor` and `currency` set to `null`.
+
+**Errors** always have the form `{"error":{"code":"...","message":"...", ...}}`; extra fields sit
+inside the `error` object. For example, resuming a job that is already `COMPLETED`:
+
+```text
+HTTP/1.1 409 Conflict
+{"error":{"code":"INVALID_STATE","current_status":"COMPLETED","message":"the job is not in a state that allows this operation"}}
+```
+
+| Status | `code` | When |
+|---|---|---|
+| 400 | `INVALID_JSON` | the body is empty, truncated, has an unknown field, a wrong type, trailing data or is over 1 MiB |
+| 401 | `UNAUTHORIZED` | `API_TOKEN` is set and a `POST` has no or a wrong bearer token (answered before the body is read; carries `WWW-Authenticate: Bearer`) |
+| 404 | `NOT_FOUND` | unknown job or product; a job id that is not a UUID is also a plain 404 |
+| 409 | `ACTIVE_JOB_EXISTS` | another job is active; `error.active_job_id` names it when starting |
+| 409 | `INVALID_STATE` | the job cannot be resumed (`COMPLETED`, `FAILED`, or `RUNNING` with a live worker); `error.current_status` says which |
+| 422 | `VALIDATION_FAILED` | a bad `update_id` or `supplier_id`, `limit` outside 1-500, a negative `offset`, an unknown `status`, `type` or `severity` value |
+| 503 | `DB_UNAVAILABLE` | PostgreSQL does not answer; the message never contains connection details |
+
+`GET /healthz` is the liveness check described under "Server configuration".
 
 ## 4. Tests
 
@@ -172,8 +370,56 @@ TEST_DATABASE_URL='postgres://catalog:catalog@localhost:55432/catalog_test?sslmo
 
 Without `TEST_DATABASE_URL` those tests are reported as skipped, not passed.
 
-Data-race run. `-race` needs a C compiler, so it runs in the Debian-based Go image on the
-compose network (the database must be up):
+| Layer | Where | What it proves |
+|---|---|---|
+| unit | most packages | revision rules, validation, hashing, retry, job state table, fixture reader, token check |
+| repository and processor | `internal/storage`, `internal/catalog`, `internal/syncjob` | SQL, constraints and triggers, one transaction per batch, rollback on failure |
+| scenarios | `tests/integration` | whole jobs through the Manager with a fake supplier and injected failures: first import, replays, stale and out-of-order revisions, withdrawal, outage and resume, crash before and after a commit, shutdown, parallel starts and resumes, every fixture's expected outcome |
+| HTTP API | `internal/api` | every endpoint and status code over a real listener, the error bodies, the token rule, and that what the change and issue endpoints report equals what is in PostgreSQL |
+| end to end | `tests/e2e` | the real server process killed and restarted (below) |
+
+The tests that carry each guarantee from section 1:
+
+| Guarantee | Tests |
+|---|---|
+| repeats change nothing | `TestReplayOfSameUpdateIsNoOp`, `TestResentRecordsUnderNewUpdateAreDuplicates`, `TestCrashAfterCommitDoesNotDuplicateEffects` |
+| revisions only go up | `TestLateLowerRevisionIsIgnored`, `TestHigherRevisionUpdatesProduct` |
+| withdrawn stays withdrawn | `TestStaleActiveCannotResurrectWithdrawnProduct`, `TestWithdrawalOfUnseenProductCreatesTombstone` |
+| a batch is applied whole or not at all | `TestInvalidRecordLeavesBatchUncommitted`, `TestCrashBeforeCommitLeavesNoPartialEffects`, `TestProcessCrashBeforeCommitRecovers` |
+| progress survives failures | `TestSupplierOutageInterruptsAndResumeCompletes`, `TestRestartedManagerResumesFromCheckpoint`, `TestProcessCrashAfterCommitRecovers`, `TestGracefulShutdownInterruptsJob` |
+| completed means completed | `TestMissingEndOfFeedNeverCompletes`, `TestOpenBlockingIssuePreventsCompletion` |
+
+### End-to-end tests
+
+```bash
+TEST_DATABASE_URL='postgres://catalog:catalog@localhost:55432/catalog_test?sslmode=disable' \
+  go test -p 1 -count=1 -v ./tests/e2e/
+```
+
+The tests build `cmd/server` into a temporary directory (so `go` must be on the `PATH`), start
+it as a child process on a free port against `TEST_DATABASE_URL`, and break it for real, using
+`UPDATE-2026-003` (five batches). Each test ends by comparing the job with the fixture's
+`expected` block, checking that no product or change row exists twice and that no issue was
+recorded, and every child process is killed when its test ends.
+
+- `TestProcessCrashAfterCommitRecovers`: with `CRASH_POINT=after_commit:BATCH-002` the process
+  exits with status 3 right after the second batch commits. The database holds two committed
+  batches and a job still `RUNNING`. A second process, started without `CRASH_POINT`, marks
+  the job `INTERRUPTED` before it opens its port; `POST .../resume` then completes it.
+- `TestProcessCrashBeforeCommitRecovers`: the same with `CRASH_POINT=before_commit:BATCH-003`,
+  where the process dies with the third batch's transaction open. Nothing of that batch
+  exists afterwards, and the resumed job still ends with the same result.
+- `TestGracefulShutdownInterruptsJob`: with `SUPPLIER_DELAY_MS=400` the job is mid-run when
+  the process gets an interrupt signal. It exits with status 0, its job is `INTERRUPTED` with
+  no issue row (a requested stop is not a problem), the next start has nothing to reconcile,
+  and a resume completes the job. This test is skipped on Windows, because a console
+  interrupt cannot be sent to a child process there; it runs on Linux and macOS and in the
+  race container below.
+
+### Data-race run
+
+`-race` needs a C compiler, so it runs in the Debian-based Go image on the compose network (the
+database must be up):
 
 ```bash
 docker run --rm --network catalog-sync_default -v "$PWD":/src -w /src -e CGO_ENABLED=1 \
@@ -181,11 +427,84 @@ docker run --rm --network catalog-sync_default -v "$PWD":/src -w /src -e CGO_ENA
   golang:1.27 go test -race -p 1 -count=1 ./...
 ```
 
-On Windows Git Bash, put `MSYS_NO_PATHCONV=1` in front of `docker run`; otherwise Git Bash
-rewrites `-w /src` into a Windows path and Docker rejects it.
+On Windows Git Bash, put `MSYS_NO_PATHCONV=1` in front of `docker run` and mount with
+`-v "$(pwd -W)":/src`; otherwise Git Bash rewrites `-w /src` and the mount path into Windows
+paths and Docker rejects them.
 
-(Reproducing a supplier outage and an application restart, and the end-to-end and smoke
-checks, added after the API lands.)
+### Smoke check and demo
+
+Both scripts need `bash`, `docker` with Compose and `curl` (no `jq`), and by default run on
+their own compose projects, so the stack you started with `docker compose up` is left alone.
+The last step of `demo.sh` runs `go test`, so it also needs Go.
+
+```bash
+bash scripts/smoke.sh                # project rcs-smoke (ports 18086 / 55436)
+API_TOKEN=<token> bash scripts/smoke.sh      # the same with the bearer token required; also checks the 401 answers
+DEMO_PAUSE=0 bash scripts/demo.sh    # project rcs-demo (ports 18087 / 55437)
+```
+
+`smoke.sh` builds and starts a throwaway stack, runs one update to `COMPLETED`, checks the
+status code of every endpoint, then removes the stack and its volume. `demo.sh` is the scripted
+walkthrough (normal sync and withdrawal, repeats and late records, a supplier outage, a restart
+and resume, an unresolved issue, and finally the test suite); every step asserts the status and
+counters its fixture promises and the script stops at the first mismatch. It refuses to start
+on a database that already has jobs, because posting a known update returns the old job; reset
+its stack with `docker compose -p rcs-demo down -v` (this deletes that stack's data). Set
+`DEMO_PAUSE` to the seconds to wait between steps (default 3) when presenting it.
+
+### Check a deployed instance
+
+```bash
+bash scripts/remote-check.sh https://<service>.onrender.com     # no token: reads and the 401 check only
+read -rs API_TOKEN && export API_TOKEN       # paste the token, press Enter; nothing is echoed
+bash scripts/remote-check.sh https://<service>.onrender.com     # with the token: also runs a sync
+```
+
+Without a token the script waits up to two minutes for a sleeping instance to answer
+`/healthz`, checks that the list endpoints are public and that a `POST` without a token is
+refused with `401` and `WWW-Authenticate: Bearer`. With `API_TOKEN` exported in your own shell
+it also starts `UPDATE-2026-001`, waits for `COMPLETED` and checks that at least four products
+are `ACTIVE`. The token reaches `curl` as a configuration line on standard input (`curl -K -`),
+so it never appears on a command line or in the process list; do not put it on the command
+line yourself. The script refuses to send the token over plain `http` to anything but
+`localhost`. It needs `bash`, `curl`, `grep` and `sed`; it exits non-zero at the first failing
+step and names it.
+
+### Reproduce an outage and a restart by hand
+
+Start a clean stack (`docker compose up --build -d`), then, with `BASE=http://localhost:8088`:
+
+```bash
+# 1. The supplier goes down at the third batch of UPDATE-2026-003.
+SUPPLIER_OUTAGE_CURSORS=cursor-003 docker compose up -d app
+curl -X POST $BASE/api/syncs -H 'Content-Type: application/json' -d '{"update_id":"UPDATE-2026-003"}'
+curl $BASE/api/syncs/<job_id>                       # a few seconds later: INTERRUPTED after 2 batches
+curl "$BASE/api/syncs/<job_id>/issues?status=OPEN"  # SUPPLIER_UNAVAILABLE, retry_count 4, TRANSIENT
+curl $BASE/api/products                             # the 4 products of the two committed batches are there
+
+# 2. The supplier is back (the container is recreated without the switch); continue the job.
+docker compose up -d app
+curl -X POST $BASE/api/syncs/<job_id>/resume        # 202; continues at cursor-003
+curl $BASE/api/syncs/<job_id>                       # COMPLETED: 5 batches, 10 created, outage issue RESOLVED
+```
+
+The same with a hard crash of the process instead of an outage. Run it on a fresh stack
+(`docker compose down -v`, then `docker compose up -d`), because an update that already has a
+job is never run again:
+
+```bash
+CRASH_POINT=after_commit:BATCH-002 docker compose up -d app
+curl -X POST $BASE/api/syncs -H 'Content-Type: application/json' -d '{"update_id":"UPDATE-2026-003"}'
+docker compose ps -a app                            # the container exited with status 3
+docker compose up -d app                            # recreated WITHOUT CRASH_POINT, or it crashes again
+docker compose logs app | grep -E 'fault.crash_point|startup.reconciled'
+curl $BASE/api/syncs/<job_id>                       # INTERRUPTED, 2 batches, "the service restarted"
+curl -X POST $BASE/api/syncs/<job_id>/resume        # then poll until COMPLETED with 10 created
+```
+
+On a server that has `API_TOKEN` set, add `-H "Authorization: Bearer $API_TOKEN"` to the two
+`POST` calls. `before_commit:<batch_id>` crashes with that batch's transaction still open.
+`docker compose down -v` ends the experiment and deletes its data.
 
 ## 5. Assumptions
 
@@ -254,8 +573,10 @@ Known limits to keep in mind:
 
 - **Single instance only.** The start-up step that marks `PENDING`/`RUNNING` jobs as
   `INTERRUPTED` assumes no other copy of the service is running. With two replicas it would
-  interrupt a job the other replica is still working on. The upgrade path is a lease or
-  heartbeat on each running job.
+  interrupt a job the other replica is still working on. Starting a job is guarded by the
+  database itself (the one-active-job index), but "one worker per job" on resume relies on the
+  process's own lock and its set of live workers, so it holds only with a single instance. The
+  upgrade path for both is a lease or heartbeat on the job row.
 - **Insert race left to the primary key.** When a product does not exist yet, two writers
   could both try to insert it; the primary key makes the second one fail loudly instead of
   overwriting. Under the single-active-job rule that cannot happen, so no extra locking was
@@ -307,7 +628,9 @@ on the `PORT` Render provides. You need a Render account and the repository on G
      -d '{"update_id":"UPDATE-2026-001"}'
    ```
 
-   A `POST` without the header, or with a wrong token, answers `401`.
+   A `POST` without the header, or with a wrong token, answers `401`. To run the whole
+   sequence as a script that keeps the token off the command line, see "Check a deployed
+   instance" under section 4.
 
 Things to know:
 
