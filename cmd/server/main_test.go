@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
@@ -277,25 +278,19 @@ func (b *lockedBuffer) String() string {
 	return b.buf.String()
 }
 
-func TestRunInterruptsJobsLeftActiveBeforeItStartsServing(t *testing.T) {
-	pool := testutil.DB(t)
-	testutil.Reset(t, pool)
-	var jobID string
-	err := pool.QueryRow(context.Background(), `INSERT INTO sync_jobs (supplier_id, supplier_update_id, status)
-		VALUES ('SUP-001', 'UPDATE-1', 'RUNNING') RETURNING id::text`).Scan(&jobID)
-	if err != nil {
-		t.Fatal(err)
-	}
-
+// startServer runs the server against the test database and returns once its listener
+// answers (the moment startup is over), with the structured log captured so far and a
+// function that stops it gracefully and returns what run returned.
+func startServer(t *testing.T) (logs *lockedBuffer, stop func() error) {
+	t.Helper()
 	addr := freeAddr(t)
 	cfg := config{DatabaseURL: os.Getenv("TEST_DATABASE_URL"), DBWait: 5 * time.Second, HTTPAddr: addr, SupplierID: "SUP-001"}
-	var logs lockedBuffer
+	logs = &lockedBuffer{}
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	t.Cleanup(cancel)
 	done := make(chan error, 1)
-	go func() { done <- run(ctx, cfg, slog.New(slog.NewJSONHandler(&logs, nil))) }()
+	go func() { done <- run(ctx, cfg, slog.New(slog.NewJSONHandler(logs, nil))) }()
 
-	// The first answer from the listener is the moment startup is over.
 	deadline := time.Now().Add(15 * time.Second)
 	for {
 		resp, err := http.Get("http://" + addr + "/healthz")
@@ -312,6 +307,40 @@ func TestRunInterruptsJobsLeftActiveBeforeItStartsServing(t *testing.T) {
 			t.Fatalf("server never answered on %s: %v", addr, err)
 		}
 	}
+	return logs, func() error {
+		cancel()
+		select {
+		case err := <-done:
+			return err
+		case <-time.After(15 * time.Second):
+			return errors.New("run did not return after its context ended")
+		}
+	}
+}
+
+// logEvent returns the first structured log line with this message, decoded, or nil.
+func logEvent(t *testing.T, logs string, msg string) map[string]any {
+	t.Helper()
+	for _, line := range strings.Split(logs, "\n") {
+		var rec map[string]any
+		if json.Unmarshal([]byte(line), &rec) == nil && rec["msg"] == msg {
+			return rec
+		}
+	}
+	return nil
+}
+
+func TestRunInterruptsJobsLeftActiveBeforeItStartsServing(t *testing.T) {
+	pool := testutil.DB(t)
+	testutil.Reset(t, pool)
+	var jobID string
+	err := pool.QueryRow(context.Background(), `INSERT INTO sync_jobs (supplier_id, supplier_update_id, status)
+		VALUES ('SUP-001', 'UPDATE-1', 'RUNNING') RETURNING id::text`).Scan(&jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	logs, stop := startServer(t)
 
 	var status string
 	if err := pool.QueryRow(context.Background(), `SELECT status FROM sync_jobs WHERE id = $1::uuid`, jobID).Scan(&status); err != nil {
@@ -325,17 +354,33 @@ func TestRunInterruptsJobsLeftActiveBeforeItStartsServing(t *testing.T) {
 	if reconciled < 0 || listening < 0 || reconciled > listening {
 		t.Fatalf("startup.reconciled must be logged before server.listening:\n%s", out)
 	}
+	rec := logEvent(t, out, "startup.reconciled")
+	if rec["level"] != "WARN" || rec["count"] != float64(1) || len(rec["job_ids"].([]any)) != 1 || rec["job_ids"].([]any)[0] != jobID {
+		t.Fatalf("startup.reconciled = %v, want WARN, count 1, job_ids [%s]", rec, jobID)
+	}
 
-	cancel()
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("graceful stop returned %v, want nil", err)
-		}
-	case <-time.After(15 * time.Second):
-		t.Fatal("run did not return after its context ended")
+	if err := stop(); err != nil {
+		t.Fatalf("graceful stop returned %v, want nil", err)
 	}
 	if out := logs.String(); !strings.Contains(out, `"msg":"workers.stopped"`) {
 		t.Fatalf("workers were not stopped on shutdown:\n%s", out)
+	}
+}
+
+func TestRunLogsReconcileOnEveryStartEvenWhenNothingWasLeftActive(t *testing.T) {
+	pool := testutil.DB(t)
+	testutil.Reset(t, pool)
+
+	logs, stop := startServer(t)
+	rec := logEvent(t, logs.String(), "startup.reconciled")
+	if rec == nil {
+		t.Fatalf("startup.reconciled was not logged on a start with nothing to reconcile:\n%s", logs.String())
+	}
+	ids, isList := rec["job_ids"].([]any)
+	if rec["level"] != "INFO" || rec["count"] != float64(0) || !isList || len(ids) != 0 {
+		t.Fatalf("startup.reconciled = %v, want INFO, count 0, job_ids []", rec)
+	}
+	if err := stop(); err != nil {
+		t.Fatalf("graceful stop returned %v, want nil", err)
 	}
 }
