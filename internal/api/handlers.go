@@ -9,7 +9,9 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"slices"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/DuongCM2004/resilient-catalog-sync/internal/catalog"
@@ -128,6 +130,43 @@ func parsePage(q url.Values) (limit, offset int, err error) {
 // writeValidation answers 422 for a well-formed request whose values are not acceptable.
 func writeValidation(w http.ResponseWriter, message string) {
 	writeError(w, http.StatusUnprocessableEntity, "VALIDATION_FAILED", message, nil)
+}
+
+// queryChoice reads an optional query parameter that, when present, must be one of allowed.
+// The error is worded for the 422 body.
+func queryChoice(q url.Values, name string, allowed ...string) (string, error) {
+	v := q.Get(name)
+	if v == "" || slices.Contains(allowed, v) {
+		return v, nil
+	}
+	return "", fmt.Errorf("%s must be one of %s", name, strings.Join(allowed, ", "))
+}
+
+// views converts a listing to its response items. The result is never nil, so an empty
+// listing encodes as [] and clients need no special case for null.
+func views[T, V any](in []T, convert func(T) V) []V {
+	out := make([]V, len(in))
+	for i, v := range in {
+		out[i] = convert(v)
+	}
+	return out
+}
+
+// jobIDFromPath returns the {id} of a job route. An id that cannot be a job id is answered
+// as "not found" here, before any SQL, exactly like an unknown one.
+func (d Deps) jobIDFromPath(w http.ResponseWriter, r *http.Request) (string, bool) {
+	id := r.PathValue("id")
+	if !isUUID(id) {
+		d.writeFailure(w, r, syncjob.ErrNotFound, nil)
+		return "", false
+	}
+	return id, true
+}
+
+// jobStatuses are the values the status filter of GET /api/syncs accepts.
+var jobStatuses = []string{
+	string(syncjob.StatusPending), string(syncjob.StatusRunning), string(syncjob.StatusInterrupted),
+	string(syncjob.StatusNeedsAttention), string(syncjob.StatusCompleted), string(syncjob.StatusFailed),
 }
 
 // requireManager answers 500 and reports false when the router was built without a Manager.
@@ -263,6 +302,47 @@ func (d Deps) startSync(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeJSON(w, http.StatusOK, newJobView(job))
 	}
+}
+
+type jobListView struct {
+	Items  []jobView `json:"items"`
+	Limit  int       `json:"limit"`
+	Offset int       `json:"offset"`
+}
+
+// listSyncs pages through jobs, newest first, optionally of one status.
+func (d Deps) listSyncs(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	limit, offset, err := parsePage(q)
+	if err != nil {
+		writeValidation(w, err.Error())
+		return
+	}
+	status, err := queryChoice(q, "status", jobStatuses...)
+	if err != nil {
+		writeValidation(w, err.Error())
+		return
+	}
+	jobs, err := syncjob.ListJobs(r.Context(), d.Pool, status, limit, offset)
+	if err != nil {
+		d.writeFailure(w, r, err, nil)
+		return
+	}
+	writeJSON(w, http.StatusOK, jobListView{Items: views(jobs, newJobView), Limit: limit, Offset: offset})
+}
+
+// getSync returns one job with its progress, counters and open blocking issue count.
+func (d Deps) getSync(w http.ResponseWriter, r *http.Request) {
+	id, ok := d.jobIDFromPath(w, r)
+	if !ok {
+		return
+	}
+	job, err := syncjob.GetJob(r.Context(), d.Pool, id)
+	if err != nil {
+		d.writeFailure(w, r, err, nil)
+		return
+	}
+	writeJSON(w, http.StatusOK, newJobView(job))
 }
 
 // healthz reports whether the database answers within a second, so an orchestrator can

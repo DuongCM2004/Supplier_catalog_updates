@@ -519,3 +519,129 @@ func TestStartSyncWhileAnotherJobIsActiveNamesTheActiveJobInsideTheError(t *test
 	env.sup.Unblock("")
 	env.mgr.Wait()
 }
+
+// rtItems returns the "items" array of a list response as objects.
+func rtItems(t *testing.T, body map[string]any) []map[string]any {
+	t.Helper()
+	raw, ok := body["items"].([]any)
+	if !ok {
+		t.Fatalf("items is not an array in %v", body)
+	}
+	items := make([]map[string]any, len(raw))
+	for i, v := range raw {
+		if items[i], ok = v.(map[string]any); !ok {
+			t.Fatalf("items[%d] is not an object: %v", i, v)
+		}
+	}
+	return items
+}
+
+// rtUpdateIDs lists supplier_update_id of each job item, in response order.
+func rtUpdateIDs(items []map[string]any) []string {
+	ids := make([]string, len(items))
+	for i, it := range items {
+		ids[i], _ = it["supplier_update_id"].(string)
+	}
+	return ids
+}
+
+// rtThreeJobs leaves UPDATE-1 and UPDATE-2 COMPLETED and UPDATE-3 INTERRUPTED after its
+// first batch (the supplier fails at cursor-2 until the test says otherwise). It returns
+// the job ids in that order.
+func rtThreeJobs(t *testing.T, env *rtEnv) (first, second, third string) {
+	t.Helper()
+	rtServe(env.sup, "UPDATE-1")
+	first = env.rtStart(t, "UPDATE-1")
+	env.mgr.Wait()
+	rtServe(env.sup, "UPDATE-2")
+	second = env.rtStart(t, "UPDATE-2")
+	env.mgr.Wait()
+	rtServe(env.sup, "UPDATE-3")
+	env.sup.FailTimes("cursor-2", -1)
+	third = env.rtStart(t, "UPDATE-3")
+	env.mgr.Wait()
+	return first, second, third
+}
+
+func TestListSyncsReturnsNewestFirstAndHonoursStatusAndPaging(t *testing.T) {
+	env := rtNewEnv(t, "")
+	_, _, third := rtThreeJobs(t, env)
+
+	rec := env.do(t, http.MethodGet, "/api/syncs", "")
+	if rec.Code != http.StatusOK || rec.Header().Get("Content-Type") != "application/json" {
+		t.Fatalf("list = %d %q: %s", rec.Code, rec.Header().Get("Content-Type"), rec.Body.String())
+	}
+	body := routesDecodeBody(t, rec)
+	rtAssertKeys(t, "job list", body, "items", "limit", "offset")
+	if body["limit"] != float64(50) || body["offset"] != float64(0) {
+		t.Errorf("limit/offset = %v/%v, want the defaults 50/0", body["limit"], body["offset"])
+	}
+	items := rtItems(t, body)
+	if got := rtUpdateIDs(items); !slices.Equal(got, []string{"UPDATE-3", "UPDATE-2", "UPDATE-1"}) {
+		t.Fatalf("order = %v, want newest first", got)
+	}
+	for _, it := range items {
+		rtAssertKeys(t, "job item", it, rtJobKeys...)
+	}
+	interrupted := items[0]
+	progress := rtObject(t, interrupted, "progress")
+	if interrupted["job_id"] != third || interrupted["status"] != "INTERRUPTED" ||
+		progress["processed_batches"] != float64(1) || progress["total_batches"] != float64(2) ||
+		progress["next_cursor"] != "cursor-2" || progress["last_batch_id"] != "BATCH-1" || progress["end_of_feed_seen"] != false {
+		t.Errorf("interrupted job = %v", interrupted)
+	}
+	if msg, _ := interrupted["last_error"].(string); !strings.Contains(msg, "cursor-2") {
+		t.Errorf("last_error = %v, want the reason naming the cursor", interrupted["last_error"])
+	}
+	if interrupted["completed_at"] != nil {
+		t.Errorf("an interrupted job has completed_at = %v", interrupted["completed_at"])
+	}
+
+	paged := routesDecodeBody(t, env.do(t, http.MethodGet, "/api/syncs?limit=1&offset=1", ""))
+	if got := rtUpdateIDs(rtItems(t, paged)); !slices.Equal(got, []string{"UPDATE-2"}) || paged["limit"] != float64(1) || paged["offset"] != float64(1) {
+		t.Errorf("page = %v (limit %v, offset %v), want only UPDATE-2 echoing limit 1 offset 1", got, paged["limit"], paged["offset"])
+	}
+	completed := routesDecodeBody(t, env.do(t, http.MethodGet, "/api/syncs?status=COMPLETED", ""))
+	if got := rtUpdateIDs(rtItems(t, completed)); !slices.Equal(got, []string{"UPDATE-2", "UPDATE-1"}) {
+		t.Errorf("COMPLETED filter = %v", got)
+	}
+
+	empty := env.do(t, http.MethodGet, "/api/syncs?status=NEEDS_ATTENTION", "")
+	if empty.Code != http.StatusOK || !strings.Contains(empty.Body.String(), `"items":[]`) {
+		t.Errorf("no match = %d %s, want 200 with an empty array, not null", empty.Code, empty.Body.String())
+	}
+}
+
+func TestListSyncsRejectsInvalidParametersWith422(t *testing.T) {
+	env := rtNewEnv(t, "")
+	for _, query := range []string{
+		"limit=0", "limit=501", "limit=abc", "limit=-1", "offset=-1", "offset=1.5",
+		"status=BOGUS", "status=completed", "status=COMPLETED,FAILED",
+	} {
+		t.Run(query, func(t *testing.T) {
+			rtAssertError(t, env.do(t, http.MethodGet, "/api/syncs?"+query, ""), http.StatusUnprocessableEntity, "VALIDATION_FAILED")
+		})
+	}
+}
+
+func TestGetSyncReturnsTheJobAndAnswers404ForUnknownOrMalformedIds(t *testing.T) {
+	env := rtNewEnv(t, "")
+	first, _, _ := rtThreeJobs(t, env)
+
+	rec := env.do(t, http.MethodGet, "/api/syncs/"+first, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("get = %d: %s", rec.Code, rec.Body.String())
+	}
+	job := routesDecodeBody(t, rec)
+	rtAssertKeys(t, "job", job, rtJobKeys...)
+	if job["job_id"] != first || job["status"] != "COMPLETED" || job["supplier_update_id"] != "UPDATE-1" {
+		t.Errorf("job = %v", job)
+	}
+
+	for _, id := range []string{
+		"00000000-0000-4000-8000-000000000000", "not-a-uuid", "3f7c2b1a9d4e4c1a8b6f0123456789ab", "1;DROP TABLE sync_jobs",
+	} {
+		rec := env.do(t, http.MethodGet, "/api/syncs/"+url.PathEscape(id), "")
+		rtAssertError(t, rec, http.StatusNotFound, "NOT_FOUND")
+	}
+}
