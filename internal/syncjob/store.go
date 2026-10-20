@@ -2,6 +2,8 @@ package syncjob
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"maps"
@@ -247,4 +249,71 @@ func reconcile(ctx context.Context, db storage.DB, lastError string) ([]string, 
 	}
 	slices.Sort(ids)
 	return ids, nil
+}
+
+// fingerprint identifies "this problem at this place" within a job: the same code at the
+// same cursor is the same issue, so a retry that fails the same way updates one open row
+// instead of adding another. The job comes from the unique index, not from the hash.
+func fingerprint(code IssueCode, cursor string) string {
+	sum := sha256.Sum256([]byte(string(code) + "|" + cursor))
+	return hex.EncodeToString(sum[:])
+}
+
+// A recurrence refreshes everything that describes the latest occurrence. Severity only
+// ever escalates: a DATABASE_ERROR first seen as a connection blip (TRANSIENT) and later
+// as a data error (BLOCKING) must end up blocking, while a later blip must not hide a
+// blocking error that is still unresolved.
+const sqlRecordIssue = `INSERT INTO sync_issues
+		(job_id, batch_id, cursor, supplier_id, product_id, code, severity, message, fingerprint, retry_count)
+	VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+	ON CONFLICT (job_id, fingerprint) WHERE status = 'OPEN' DO UPDATE SET
+		retry_count = sync_issues.retry_count + 1,
+		last_seen_at = now(),
+		message = EXCLUDED.message,
+		batch_id = EXCLUDED.batch_id,
+		supplier_id = EXCLUDED.supplier_id,
+		product_id = EXCLUDED.product_id,
+		severity = CASE WHEN EXCLUDED.severity = 'BLOCKING' THEN 'BLOCKING' ELSE sync_issues.severity END`
+
+// recordIssue stores a problem for iss.JobID, or bumps retry_count on the open issue with
+// the same code and cursor. Callers hold the job row lock (lockJob) in tx, which is what
+// makes the open-issue count read at completion time race-free. iss.Cursor is required and
+// must be the job's next_cursor when the problem was found: it is what lets the issue
+// resolve itself once the batch at that cursor commits.
+func recordIssue(ctx context.Context, tx pgx.Tx, iss Issue) error {
+	if iss.Cursor == nil {
+		return fmt.Errorf("record %s issue for job %s: cursor is required so the issue can resolve", iss.Code, iss.JobID)
+	}
+	_, err := tx.Exec(ctx, sqlRecordIssue, iss.JobID, iss.BatchID, iss.Cursor, iss.SupplierID, iss.ProductID,
+		string(iss.Code), string(iss.Severity), iss.Message, fingerprint(iss.Code, *iss.Cursor), iss.RetryCount)
+	if err != nil {
+		return fmt.Errorf("record %s issue for job %s: %w", iss.Code, iss.JobID, err)
+	}
+	return nil
+}
+
+const sqlResolveIssues = `UPDATE sync_issues SET status = 'RESOLVED', resolved_at = now()
+	WHERE job_id = $1::uuid AND status = 'OPEN' AND (severity = 'TRANSIENT' OR cursor = $2)`
+
+// resolveIssues closes what a successful commit of the batch at `cursor` proves is over:
+// every transient problem (the supplier or database answered again) and the blocking
+// problems raised at that same cursor. Blocking issues at other cursors stay open. Callers
+// hold the job row lock in tx.
+func resolveIssues(ctx context.Context, tx pgx.Tx, jobID, cursor string) error {
+	if _, err := tx.Exec(ctx, sqlResolveIssues, jobID, cursor); err != nil {
+		return fmt.Errorf("resolve issues for job %s at cursor %q: %w", jobID, cursor, err)
+	}
+	return nil
+}
+
+const sqlCountOpenBlocking = `SELECT count(*) FROM sync_issues WHERE job_id = $1::uuid AND status = 'OPEN' AND severity = 'BLOCKING'`
+
+// countOpenBlocking is the number of unresolved issues that forbid COMPLETED. It is only
+// race-free when the caller holds the job row lock.
+func countOpenBlocking(ctx context.Context, db storage.DB, jobID string) (int, error) {
+	var n int
+	if err := db.QueryRow(ctx, sqlCountOpenBlocking, jobID).Scan(&n); err != nil {
+		return 0, fmt.Errorf("count open blocking issues for job %s: %w", jobID, err)
+	}
+	return n, nil
 }

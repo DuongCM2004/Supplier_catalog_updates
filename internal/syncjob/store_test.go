@@ -7,6 +7,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/DuongCM2004/resilient-catalog-sync/internal/testutil"
@@ -338,5 +339,216 @@ func TestReconcileInterruptsOnlyJobsThatWereActive(t *testing.T) {
 	}
 	if ids, err := reconcile(ctx, pool, "again"); err != nil || len(ids) != 0 {
 		t.Fatalf("second reconcile = %v, %v, want nothing left to do", ids, err)
+	}
+}
+
+type storeIssueRow struct {
+	Cursor, Code, Severity, Status, Message string
+	BatchID, ProductID, SupplierID          *string
+	RetryCount                              int
+	Resolved                                bool
+}
+
+func storeIssueRows(t *testing.T, pool *pgxpool.Pool, jobID string) []storeIssueRow {
+	t.Helper()
+	const q = `SELECT cursor, code, severity, status, message, batch_id, product_id, supplier_id, retry_count, resolved_at IS NOT NULL
+		FROM sync_issues WHERE job_id = $1::uuid ORDER BY first_seen_at, id`
+	rows, err := pool.Query(context.Background(), q, jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (storeIssueRow, error) {
+		var x storeIssueRow
+		err := r.Scan(&x.Cursor, &x.Code, &x.Severity, &x.Status, &x.Message, &x.BatchID, &x.ProductID, &x.SupplierID, &x.RetryCount, &x.Resolved)
+		return x, err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+func storeIssue(jobID string, code IssueCode, severity Severity, cursor string) Issue {
+	return Issue{JobID: jobID, Cursor: &cursor, Code: code, Severity: severity, Message: string(code) + " at " + cursor}
+}
+
+// storeInJobTx runs fn the way production writers do: job row lock first, then the writes.
+func storeInJobTx(t *testing.T, pool *pgxpool.Pool, jobID string, fn func(ctx context.Context, tx pgx.Tx) error) {
+	t.Helper()
+	ctx := context.Background()
+	err := pgx.BeginFunc(ctx, pool, func(tx pgx.Tx) error {
+		if _, err := lockJob(ctx, tx, jobID); err != nil {
+			return err
+		}
+		return fn(ctx, tx)
+	})
+	if err != nil {
+		t.Fatalf("job transaction: %v", err)
+	}
+}
+
+func storeRecord(t *testing.T, pool *pgxpool.Pool, iss Issue) {
+	t.Helper()
+	storeInJobTx(t, pool, iss.JobID, func(ctx context.Context, tx pgx.Tx) error { return recordIssue(ctx, tx, iss) })
+}
+
+func TestFingerprintIsStablePerCodeAndCursor(t *testing.T) {
+	a := fingerprint(CodeVersionConflict, "cursor-002")
+	if len(a) != 64 || a != fingerprint(CodeVersionConflict, "cursor-002") {
+		t.Fatalf("fingerprint %q is not a stable sha256 hex", a)
+	}
+	if a == fingerprint(CodeVersionConflict, "cursor-003") || a == fingerprint(CodeInvalidBatch, "cursor-002") {
+		t.Fatal("fingerprint must change with the code and with the cursor")
+	}
+}
+
+func TestRecordIssueTwiceKeepsOneOpenRowAndCountsTheRecurrence(t *testing.T) {
+	pool := storeTestPool(t)
+	job := storeMustCreate(t, pool, "UPDATE-1")
+
+	first := storeIssue(job.ID, CodeVersionConflict, SeverityBlocking, "cursor-002")
+	storeRecord(t, pool, first)
+	second := first
+	second.Message = "still conflicting"
+	storeRecord(t, pool, second)
+
+	rows := storeIssueRows(t, pool, job.ID)
+	if len(rows) != 1 {
+		t.Fatalf("issue rows = %d, want 1: %+v", len(rows), rows)
+	}
+	if rows[0].RetryCount != 1 || rows[0].Message != "still conflicting" || rows[0].Status != "OPEN" {
+		t.Fatalf("row = %+v, want retry_count 1, latest message, OPEN", rows[0])
+	}
+
+	// A different cursor or a different code is a different problem.
+	storeRecord(t, pool, storeIssue(job.ID, CodeVersionConflict, SeverityBlocking, "cursor-003"))
+	storeRecord(t, pool, storeIssue(job.ID, CodeInvalidBatch, SeverityBlocking, "cursor-002"))
+	if n := len(storeIssueRows(t, pool, job.ID)); n != 3 {
+		t.Fatalf("issue rows = %d, want 3 distinct problems", n)
+	}
+}
+
+func TestIssueResolvedThenSeenAgainOpensNewRow(t *testing.T) {
+	pool := storeTestPool(t)
+	job := storeMustCreate(t, pool, "UPDATE-1")
+	iss := storeIssue(job.ID, CodeInvalidProductData, SeverityBlocking, "cursor-002")
+
+	storeRecord(t, pool, iss)
+	storeInJobTx(t, pool, job.ID, func(ctx context.Context, tx pgx.Tx) error { return resolveIssues(ctx, tx, job.ID, "cursor-002") })
+	storeRecord(t, pool, iss)
+
+	rows := storeIssueRows(t, pool, job.ID)
+	if len(rows) != 2 {
+		t.Fatalf("issue rows = %d, want the resolved one plus a new open one: %+v", len(rows), rows)
+	}
+	if rows[0].Status != "RESOLVED" || !rows[0].Resolved || rows[1].Status != "OPEN" || rows[1].RetryCount != 0 {
+		t.Fatalf("rows = %+v, want [RESOLVED with resolved_at, OPEN with retry_count 0]", rows)
+	}
+}
+
+func TestRecordIssueRefreshesWhatDescribesTheLatestOccurrence(t *testing.T) {
+	pool := storeTestPool(t)
+	job := storeMustCreate(t, pool, "UPDATE-1")
+	str := func(s string) *string { return &s }
+
+	iss := storeIssue(job.ID, CodeVersionConflict, SeverityBlocking, "cursor-002")
+	iss.BatchID, iss.SupplierID, iss.ProductID = str("BATCH-002"), str("SUP-001"), str("SKU-101")
+	storeRecord(t, pool, iss)
+	iss.BatchID, iss.SupplierID, iss.ProductID = str("BATCH-002b"), str("SUP-002"), str("SKU-202")
+	storeRecord(t, pool, iss)
+
+	rows := storeIssueRows(t, pool, job.ID)
+	if len(rows) != 1 {
+		t.Fatalf("issue rows = %d, want 1", len(rows))
+	}
+	r := rows[0]
+	if r.ProductID == nil || *r.ProductID != "SKU-202" || r.BatchID == nil || *r.BatchID != "BATCH-002b" ||
+		r.SupplierID == nil || *r.SupplierID != "SUP-002" {
+		t.Fatalf("row = product %v batch %v supplier %v, want the second occurrence", r.ProductID, r.BatchID, r.SupplierID)
+	}
+}
+
+func TestRecordIssueSeverityOnlyEscalates(t *testing.T) {
+	pool := storeTestPool(t)
+	job := storeMustCreate(t, pool, "UPDATE-1")
+
+	storeRecord(t, pool, storeIssue(job.ID, CodeDatabaseError, SeverityTransient, "cursor-002"))
+	storeRecord(t, pool, storeIssue(job.ID, CodeDatabaseError, SeverityBlocking, "cursor-002"))
+	storeRecord(t, pool, storeIssue(job.ID, CodeDatabaseError, SeverityTransient, "cursor-002"))
+
+	rows := storeIssueRows(t, pool, job.ID)
+	if len(rows) != 1 || rows[0].Severity != "BLOCKING" || rows[0].RetryCount != 2 {
+		t.Fatalf("rows = %+v, want one BLOCKING row seen 3 times", rows)
+	}
+	if n, err := countOpenBlocking(context.Background(), pool, job.ID); err != nil || n != 1 {
+		t.Fatalf("countOpenBlocking = %d, %v, want 1", n, err)
+	}
+}
+
+func TestRecordIssueWithoutCursorIsRejected(t *testing.T) {
+	pool := storeTestPool(t)
+	job := storeMustCreate(t, pool, "UPDATE-1")
+	ctx := context.Background()
+
+	err := pgx.BeginFunc(ctx, pool, func(tx pgx.Tx) error {
+		return recordIssue(ctx, tx, Issue{JobID: job.ID, Code: CodeInvalidBatch, Severity: SeverityBlocking, Message: "no cursor"})
+	})
+	if err == nil {
+		t.Fatal("an issue without a cursor could never resolve; recordIssue must refuse it")
+	}
+	if n := len(storeIssueRows(t, pool, job.ID)); n != 0 {
+		t.Fatalf("issue rows = %d, want 0", n)
+	}
+}
+
+func TestResolveIssuesClosesTransientAndOnlyThatCursorsBlockingIssues(t *testing.T) {
+	pool := storeTestPool(t)
+	ctx := context.Background()
+	job := storeMustCreate(t, pool, "UPDATE-1")
+
+	storeRecord(t, pool, storeIssue(job.ID, CodeSupplierUnavailable, SeverityTransient, "cursor-003"))
+	storeRecord(t, pool, storeIssue(job.ID, CodeVersionConflict, SeverityBlocking, "cursor-002"))
+	storeRecord(t, pool, storeIssue(job.ID, CodeInvalidBatch, SeverityBlocking, "cursor-004"))
+
+	storeInJobTx(t, pool, job.ID, func(ctx context.Context, tx pgx.Tx) error {
+		if n, err := countOpenBlocking(ctx, tx, job.ID); err != nil || n != 2 {
+			t.Errorf("open blocking before = %d, %v, want 2", n, err)
+		}
+		return resolveIssues(ctx, tx, job.ID, "cursor-002")
+	})
+
+	open := map[string]bool{}
+	for _, r := range storeIssueRows(t, pool, job.ID) {
+		open[r.Code] = r.Status == "OPEN"
+	}
+	if open["SUPPLIER_UNAVAILABLE"] || open["VERSION_CONFLICT"] || !open["INVALID_BATCH"] {
+		t.Fatalf("open after resolving cursor-002 = %v, want only INVALID_BATCH (cursor-004) open", open)
+	}
+	if n, err := countOpenBlocking(ctx, pool, job.ID); err != nil || n != 1 {
+		t.Fatalf("countOpenBlocking = %d, %v, want 1", n, err)
+	}
+	if got, _ := GetJob(ctx, pool, job.ID); got.OpenBlockingIssues != 1 {
+		t.Fatalf("GetJob.OpenBlockingIssues = %d, want 1", got.OpenBlockingIssues)
+	}
+}
+
+func TestResolveIssuesLeavesOtherJobsAlone(t *testing.T) {
+	pool := storeTestPool(t)
+	ctx := context.Background()
+	first := storeMustCreate(t, pool, "UPDATE-1")
+	if err := transition(ctx, pool, first.ID, nil, StatusInterrupted, nil); err != nil {
+		t.Fatal(err)
+	}
+	second := storeMustCreate(t, pool, "UPDATE-2")
+
+	storeRecord(t, pool, storeIssue(first.ID, CodeVersionConflict, SeverityBlocking, "cursor-002"))
+	storeRecord(t, pool, storeIssue(second.ID, CodeVersionConflict, SeverityBlocking, "cursor-002"))
+	storeInJobTx(t, pool, second.ID, func(ctx context.Context, tx pgx.Tx) error { return resolveIssues(ctx, tx, second.ID, "cursor-002") })
+
+	if n, _ := countOpenBlocking(ctx, pool, first.ID); n != 1 {
+		t.Fatalf("first job open blocking = %d, want 1: resolving one job must not touch another", n)
+	}
+	if n, _ := countOpenBlocking(ctx, pool, second.ID); n != 0 {
+		t.Fatalf("second job open blocking = %d, want 0", n)
 	}
 }
