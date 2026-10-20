@@ -1,0 +1,8 @@
+.git
+.githooks
+.env
+Brainstorm
+plans
+bin
+tests
+*.md
