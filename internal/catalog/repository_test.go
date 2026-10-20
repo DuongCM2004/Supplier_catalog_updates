@@ -387,3 +387,151 @@ func wantCheckViolation(t *testing.T, err error, message string) {
 		t.Fatalf("want SQLSTATE 23514 containing %q, got %v", message, err)
 	}
 }
+
+func fromSupplier(id string, e catalog.SupplierProduct) catalog.SupplierProduct {
+	e.SupplierID = id
+	return e
+}
+
+// seedCatalog stores, per supplier, active and withdrawn products:
+//
+//	SUP-001: A, B, D active; C withdrawn    SUP-002: X active; Y withdrawn
+func seedCatalog(t *testing.T, pool *pgxpool.Pool) {
+	t.Helper()
+	mustApply(t, pool,
+		active("A", 1, "Widget", 100), active("B", 1, "Bolt", 200), withdrawn("C", 2), active("D", 1, "Dial", 300),
+		fromSupplier("SUP-002", active("X", 1, "Xylophone", 400)), fromSupplier("SUP-002", withdrawn("Y", 3)))
+}
+
+func keys(products []catalog.Product) []string {
+	out := []string{}
+	for _, p := range products {
+		out = append(out, p.SupplierID+"/"+p.ProductID)
+	}
+	return out
+}
+
+func TestListProductsHidesTombstonesUnlessAsked(t *testing.T) {
+	pool := newPool(t)
+	seedCatalog(t, pool)
+
+	tests := []struct {
+		name   string
+		status string
+		want   []string
+	}{
+		{"default is active only", "", []string{"SUP-001/A", "SUP-001/B", "SUP-001/D", "SUP-002/X"}},
+		{"explicit active", "ACTIVE", []string{"SUP-001/A", "SUP-001/B", "SUP-001/D", "SUP-002/X"}},
+		{"withdrawn only", "WITHDRAWN", []string{"SUP-001/C", "SUP-002/Y"}},
+		{"all in key order", "ALL", []string{"SUP-001/A", "SUP-001/B", "SUP-001/C", "SUP-001/D", "SUP-002/X", "SUP-002/Y"}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := catalog.ListProducts(context.Background(), pool, catalog.ListFilter{Status: tc.status})
+			if err != nil {
+				t.Fatalf("ListProducts: %v", err)
+			}
+			if !slices.Equal(keys(got), tc.want) {
+				t.Fatalf("products = %v, want %v", keys(got), tc.want)
+			}
+		})
+	}
+
+	if _, err := catalog.ListProducts(context.Background(), pool, catalog.ListFilter{Status: "DELETED"}); err == nil {
+		t.Fatal("unknown status filter was accepted")
+	}
+}
+
+func TestListProductsFiltersBySupplierAndPages(t *testing.T) {
+	pool := newPool(t)
+	seedCatalog(t, pool)
+	ctx := context.Background()
+
+	tests := []struct {
+		name   string
+		filter catalog.ListFilter
+		want   []string
+	}{
+		{"one supplier", catalog.ListFilter{SupplierID: "SUP-002", Status: "ALL"}, []string{"SUP-002/X", "SUP-002/Y"}},
+		{"unknown supplier", catalog.ListFilter{SupplierID: "SUP-404", Status: "ALL"}, []string{}},
+		{"first page", catalog.ListFilter{SupplierID: "SUP-001", Status: "ALL", Limit: 2}, []string{"SUP-001/A", "SUP-001/B"}},
+		{"second page", catalog.ListFilter{SupplierID: "SUP-001", Status: "ALL", Limit: 2, Offset: 2}, []string{"SUP-001/C", "SUP-001/D"}},
+		{"past the end", catalog.ListFilter{SupplierID: "SUP-001", Status: "ALL", Limit: 2, Offset: 4}, []string{}},
+		{"zero limit uses the default page size", catalog.ListFilter{Status: "ALL"}, []string{"SUP-001/A", "SUP-001/B", "SUP-001/C", "SUP-001/D", "SUP-002/X", "SUP-002/Y"}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := catalog.ListProducts(ctx, pool, tc.filter)
+			if err != nil {
+				t.Fatalf("ListProducts: %v", err)
+			}
+			if got == nil || !slices.Equal(keys(got), tc.want) {
+				t.Fatalf("products = %v (nil=%t), want %v", keys(got), got == nil, tc.want)
+			}
+		})
+	}
+}
+
+func TestListProductsReturnsStoredFields(t *testing.T) {
+	pool := newPool(t)
+	seedCatalog(t, pool)
+
+	got, err := catalog.ListProducts(context.Background(), pool, catalog.ListFilter{SupplierID: "SUP-001", Status: "ALL", Limit: 3})
+	if err != nil {
+		t.Fatalf("ListProducts: %v", err)
+	}
+	a, c := got[0], got[2]
+	if a.Status != catalog.StatusActive || a.Revision != 1 || *a.Name != "Widget" || *a.PriceMinor != 100 || *a.Currency != "USD" || a.WithdrawnAt != nil || a.PayloadHash == "" {
+		t.Fatalf("active product = %+v", a)
+	}
+	if c.Status != catalog.StatusWithdrawn || c.Revision != 2 || c.Name != nil || c.WithdrawnAt == nil {
+		t.Fatalf("tombstone = %+v", c)
+	}
+}
+
+func TestGetProductReturnsTombstonesAndReportsMissing(t *testing.T) {
+	pool := newPool(t)
+	seedCatalog(t, pool)
+	ctx := context.Background()
+
+	a, err := catalog.GetProduct(ctx, pool, "SUP-001", "A")
+	if err != nil || a.ProductID != "A" || *a.Name != "Widget" {
+		t.Fatalf("GetProduct A = %+v, %v", a, err)
+	}
+	c, err := catalog.GetProduct(ctx, pool, "SUP-001", "C")
+	if err != nil || c.Status != catalog.StatusWithdrawn || c.WithdrawnAt == nil {
+		t.Fatalf("GetProduct C = %+v, %v", c, err)
+	}
+
+	for _, key := range [][2]string{{"SUP-001", "NOPE"}, {"SUP-002", "A"}, {"SUP-404", "A"}} {
+		if _, err := catalog.GetProduct(ctx, pool, key[0], key[1]); !errors.Is(err, catalog.ErrNotFound) {
+			t.Fatalf("GetProduct %v: want ErrNotFound, got %v", key, err)
+		}
+	}
+}
+
+// The read functions take storage.DB, so they also work inside a transaction and see its
+// uncommitted writes.
+func TestReadFunctionsWorkInsideATransaction(t *testing.T) {
+	pool := newPool(t)
+	ctx := context.Background()
+
+	err := pgx.BeginFunc(ctx, pool, func(tx pgx.Tx) error {
+		if _, err := catalog.ApplyBatch(ctx, tx, []catalog.SupplierProduct{active("A", 1, "Widget", 100)}); err != nil {
+			return err
+		}
+		if p, err := catalog.GetProduct(ctx, tx, supplier, "A"); err != nil || p.Revision != 1 {
+			t.Errorf("GetProduct in tx = %+v, %v", p, err)
+		}
+		if list, err := catalog.ListProducts(ctx, tx, catalog.ListFilter{}); err != nil || len(list) != 1 {
+			t.Errorf("ListProducts in tx = %v, %v", keys(list), err)
+		}
+		return errors.New("roll back")
+	})
+	if err == nil {
+		t.Fatal("transaction unexpectedly committed")
+	}
+	if _, err := catalog.GetProduct(ctx, pool, supplier, "A"); !errors.Is(err, catalog.ErrNotFound) {
+		t.Fatalf("rolled-back product is visible: %v", err)
+	}
+}

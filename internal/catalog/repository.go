@@ -6,6 +6,8 @@ import (
 	"fmt"
 
 	"github.com/jackc/pgx/v5"
+
+	"github.com/DuongCM2004/resilient-catalog-sync/internal/storage"
 )
 
 // productColumns is the one column list every product query selects or returns, in the
@@ -187,4 +189,62 @@ func updateProduct(ctx context.Context, tx pgx.Tx, before *Product, ev SupplierP
 		return nil, fmt.Errorf("catalog: %s %s/%s from revision %d: %w", d, ev.SupplierID, ev.ProductID, before.Revision, err)
 	}
 	return &p, nil
+}
+
+const (
+	defaultListLimit = 50
+	maxListLimit     = 500
+)
+
+const listProductsSQL = `
+SELECT ` + productColumns + `
+FROM products
+WHERE ($1::text = '' OR supplier_id = $1)
+  AND ($2::text = 'ALL' OR status = $2)
+ORDER BY supplier_id, product_id
+LIMIT $3 OFFSET $4`
+
+// ListProducts returns stored products ordered by key. Status "" means ACTIVE, so
+// tombstones stay out of the default listing; "WITHDRAWN" and "ALL" include them. A Limit
+// outside 1..500 falls back to the default or the cap, so a zero value never silently
+// returns nothing and no call is unbounded.
+func ListProducts(ctx context.Context, db storage.DB, f ListFilter) ([]Product, error) {
+	status := f.Status
+	switch status {
+	case "":
+		status = string(StatusActive)
+	case string(StatusActive), string(StatusWithdrawn), "ALL":
+	default:
+		return nil, fmt.Errorf("catalog: unknown status filter %q", f.Status)
+	}
+	limit := f.Limit
+	if limit <= 0 {
+		limit = defaultListLimit
+	}
+	limit = min(limit, maxListLimit)
+	offset := max(f.Offset, 0)
+
+	rows, err := db.Query(ctx, listProductsSQL, f.SupplierID, status, limit, offset)
+	if err != nil {
+		return nil, fmt.Errorf("catalog: list products: %w", err)
+	}
+	products, err := pgx.CollectRows(rows, rowToProduct)
+	if err != nil {
+		return nil, fmt.Errorf("catalog: list products: %w", err)
+	}
+	return products, nil
+}
+
+const getProductSQL = `SELECT ` + productColumns + ` FROM products WHERE supplier_id = $1 AND product_id = $2`
+
+// GetProduct returns one stored product, tombstones included, or ErrNotFound.
+func GetProduct(ctx context.Context, db storage.DB, supplierID, productID string) (Product, error) {
+	p, err := scanProduct(db.QueryRow(ctx, getProductSQL, supplierID, productID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Product{}, ErrNotFound
+	}
+	if err != nil {
+		return Product{}, fmt.Errorf("catalog: get product %s/%s: %w", supplierID, productID, err)
+	}
+	return p, nil
 }
