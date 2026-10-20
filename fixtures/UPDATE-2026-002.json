@@ -1,0 +1,41 @@
+{
+  "update_id": "UPDATE-2026-002",
+  "supplier_id": "SUP-001",
+  "description": "Late and repeated records: older revisions, exact repeats, a withdrawn product offered as ACTIVE again, revisions arriving out of order inside one batch. Total batch count is not announced.",
+  "requires": ["UPDATE-2026-001"],
+  "expected": { "status": "COMPLETED", "created": 1, "updated": 2, "withdrawn": 0, "duplicate": 3, "stale": 2 },
+  "pages": [
+    {
+      "cursor": "",
+      "batch": {
+        "update_id": "UPDATE-2026-002", "batch_id": "BATCH-001", "next_cursor": "cursor-002", "has_more": true,
+        "products": [
+          { "supplier_id": "SUP-001", "product_id": "SKU-101", "name": "Trail Backpack 30L", "price_minor": 8990, "currency": "USD", "revision": 1, "status": "ACTIVE" },
+          { "supplier_id": "SUP-001", "product_id": "SKU-101", "name": "Trail Backpack 30L", "price_minor": 9490, "currency": "USD", "revision": 2, "status": "ACTIVE" },
+          { "supplier_id": "SUP-001", "product_id": "SKU-103", "name": "Camping Lantern", "price_minor": 3200, "currency": "USD", "revision": 1, "status": "ACTIVE" }
+        ]
+      }
+    },
+    {
+      "cursor": "cursor-002",
+      "batch": {
+        "update_id": "UPDATE-2026-002", "batch_id": "BATCH-002", "next_cursor": "cursor-003", "has_more": true,
+        "products": [
+          { "supplier_id": "SUP-001", "product_id": "SKU-104", "name": "Merino Hiking Socks", "price_minor": 2090, "currency": "USD", "revision": 3, "status": "ACTIVE" },
+          { "supplier_id": "SUP-001", "product_id": "SKU-104", "name": "Merino Hiking Socks", "price_minor": 1990, "currency": "USD", "revision": 2, "status": "ACTIVE" },
+          { "supplier_id": "SUP-001", "product_id": "SKU-105", "name": "Folding Camp Stool", "price_minor": 3790, "currency": "USD", "revision": 1, "status": "ACTIVE" },
+          { "supplier_id": "SUP-001", "product_id": "SKU-105", "name": "Folding Camp Stool", "price_minor": 3790, "currency": "USD", "revision": 1, "status": "ACTIVE" }
+        ]
+      }
+    },
+    {
+      "cursor": "cursor-003",
+      "batch": {
+        "update_id": "UPDATE-2026-002", "batch_id": "BATCH-003", "next_cursor": "", "has_more": false,
+        "products": [
+          { "supplier_id": "SUP-001", "product_id": "SKU-106", "name": "Insulated Mug 350ml", "price_minor": 1650, "currency": "USD", "revision": 1, "status": "ACTIVE" }
+        ]
+      }
+    }
+  ]
+}

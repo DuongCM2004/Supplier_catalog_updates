@@ -1,0 +1,29 @@
+{
+  "update_id": "UPDATE-2026-007",
+  "supplier_id": "SUP-001",
+  "total_batches": 2,
+  "description": "The last page has no has_more marker, so the end of the feed cannot be trusted. The job must never be reported as completed.",
+  "requires": [],
+  "expected": { "status": "NEEDS_ATTENTION", "created": 2, "updated": 0, "withdrawn": 0, "duplicate": 0, "stale": 0, "issue": "INVALID_BATCH" },
+  "pages": [
+    {
+      "cursor": "",
+      "batch": {
+        "update_id": "UPDATE-2026-007", "batch_id": "BATCH-001", "next_cursor": "cursor-002", "has_more": true,
+        "products": [
+          { "supplier_id": "SUP-001", "product_id": "SKU-501", "name": "Linen Throw Blanket", "price_minor": 5900, "currency": "USD", "revision": 1, "status": "ACTIVE" },
+          { "supplier_id": "SUP-001", "product_id": "SKU-502", "name": "Wool Cushion Cover", "price_minor": 2800, "currency": "USD", "revision": 1, "status": "ACTIVE" }
+        ]
+      }
+    },
+    {
+      "cursor": "cursor-002",
+      "batch": {
+        "update_id": "UPDATE-2026-007", "batch_id": "BATCH-002", "next_cursor": "",
+        "products": [
+          { "supplier_id": "SUP-001", "product_id": "SKU-503", "name": "Cotton Bath Towel", "price_minor": 1900, "currency": "USD", "revision": 1, "status": "ACTIVE" }
+        ]
+      }
+    }
+  ]
+}

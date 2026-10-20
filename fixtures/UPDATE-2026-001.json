@@ -1,0 +1,43 @@
+{
+  "update_id": "UPDATE-2026-001",
+  "supplier_id": "SUP-001",
+  "total_batches": 3,
+  "description": "Normal import: create products, update two of them, withdraw one, and withdraw a product never seen before (tombstone).",
+  "requires": [],
+  "expected": { "status": "COMPLETED", "created": 5, "updated": 2, "withdrawn": 2, "duplicate": 0, "stale": 0 },
+  "pages": [
+    {
+      "cursor": "",
+      "batch": {
+        "update_id": "UPDATE-2026-001", "batch_id": "BATCH-001", "next_cursor": "cursor-002", "has_more": true,
+        "products": [
+          { "supplier_id": "SUP-001", "product_id": "SKU-101", "name": "Trail Backpack 30L", "price_minor": 8990, "currency": "USD", "revision": 1, "status": "ACTIVE" },
+          { "supplier_id": "SUP-001", "product_id": "SKU-102", "name": "Steel Water Bottle 750ml", "price_minor": 2450, "currency": "USD", "revision": 1, "status": "ACTIVE" },
+          { "supplier_id": "SUP-001", "product_id": "SKU-103", "name": "Camping Lantern", "price_minor": 3200, "currency": "USD", "revision": 1, "status": "ACTIVE" },
+          { "supplier_id": "SUP-001", "product_id": "SKU-104", "name": "Merino Hiking Socks", "price_minor": 1890, "currency": "USD", "revision": 1, "status": "ACTIVE" }
+        ]
+      }
+    },
+    {
+      "cursor": "cursor-002",
+      "batch": {
+        "update_id": "UPDATE-2026-001", "batch_id": "BATCH-002", "next_cursor": "cursor-003", "has_more": true,
+        "products": [
+          { "supplier_id": "SUP-001", "product_id": "SKU-101", "name": "Trail Backpack 30L", "price_minor": 9490, "currency": "USD", "revision": 2, "status": "ACTIVE" },
+          { "supplier_id": "SUP-001", "product_id": "SKU-102", "name": "Steel Water Bottle 750ml", "price_minor": 2650, "currency": "USD", "revision": 2, "status": "ACTIVE" },
+          { "supplier_id": "SUP-001", "product_id": "SKU-105", "name": "Folding Camp Stool", "price_minor": 3790, "currency": "USD", "revision": 1, "status": "ACTIVE" }
+        ]
+      }
+    },
+    {
+      "cursor": "cursor-003",
+      "batch": {
+        "update_id": "UPDATE-2026-001", "batch_id": "BATCH-003", "next_cursor": "", "has_more": false,
+        "products": [
+          { "supplier_id": "SUP-001", "product_id": "SKU-103", "revision": 2, "status": "WITHDRAWN" },
+          { "supplier_id": "SUP-001", "product_id": "SKU-900", "revision": 4, "status": "WITHDRAWN" }
+        ]
+      }
+    }
+  ]
+}

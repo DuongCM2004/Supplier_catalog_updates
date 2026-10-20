@@ -1,0 +1,39 @@
+{
+  "update_id": "UPDATE-2026-009",
+  "supplier_id": "SUP-001",
+  "total_batches": 3,
+  "description": "The page at cursor-002 reuses BATCH-001, already committed, but carries different products. The job must stop rather than skip or re-apply it, and never reach the last page.",
+  "requires": [],
+  "expected": { "status": "NEEDS_ATTENTION", "created": 2, "updated": 0, "withdrawn": 0, "duplicate": 0, "stale": 0, "issue": "BATCH_CONFLICT" },
+  "pages": [
+    {
+      "cursor": "",
+      "batch": {
+        "update_id": "UPDATE-2026-009", "batch_id": "BATCH-001", "next_cursor": "cursor-002", "has_more": true,
+        "products": [
+          { "supplier_id": "SUP-001", "product_id": "SKU-701", "name": "Bamboo Desk Organizer", "price_minor": 3300, "currency": "USD", "revision": 1, "status": "ACTIVE" },
+          { "supplier_id": "SUP-001", "product_id": "SKU-702", "name": "Monitor Stand", "price_minor": 6400, "currency": "USD", "revision": 1, "status": "ACTIVE" }
+        ]
+      }
+    },
+    {
+      "cursor": "cursor-002",
+      "batch": {
+        "update_id": "UPDATE-2026-009", "batch_id": "BATCH-001", "next_cursor": "cursor-003", "has_more": true,
+        "products": [
+          { "supplier_id": "SUP-001", "product_id": "SKU-703", "name": "USB-C Hub", "price_minor": 5600, "currency": "USD", "revision": 1, "status": "ACTIVE" },
+          { "supplier_id": "SUP-001", "product_id": "SKU-704", "name": "Cable Clips 10pk", "price_minor": 700, "currency": "USD", "revision": 1, "status": "ACTIVE" }
+        ]
+      }
+    },
+    {
+      "cursor": "cursor-003",
+      "batch": {
+        "update_id": "UPDATE-2026-009", "batch_id": "BATCH-003", "next_cursor": "", "has_more": false,
+        "products": [
+          { "supplier_id": "SUP-001", "product_id": "SKU-705", "name": "Desk Mat", "price_minor": 2900, "currency": "USD", "revision": 1, "status": "ACTIVE" }
+        ]
+      }
+    }
+  ]
+}
