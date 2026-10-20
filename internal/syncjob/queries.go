@@ -110,10 +110,10 @@ func listScanChange(row pgx.CollectableRow) (Change, error) {
 }
 
 // ListChanges returns the catalog changes a job applied, ordered by creation time then id;
-// changeType "" means every type. Changes written by one transaction share a timestamp
-// unless the writer sets it per row, so within a batch the id decides the order: stable for
-// paging, but not necessarily the order the events were applied in. An unknown or
-// malformed job id is ErrNotFound.
+// changeType "" means every type. The processor stamps each change row with
+// clock_timestamp() as it applies the event, so (created_at, id) order is the order the
+// events were applied in, also within one batch; the id only breaks ties and keeps paging
+// stable. An unknown or malformed job id is ErrNotFound.
 func ListChanges(ctx context.Context, db storage.DB, jobID, changeType string, limit, offset int) ([]Change, error) {
 	if err := listRequireJob(ctx, db, jobID); err != nil {
 		return nil, err
