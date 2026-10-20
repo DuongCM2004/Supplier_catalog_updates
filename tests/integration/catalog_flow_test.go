@@ -342,6 +342,7 @@ func TestReplayOfSameUpdateIsNoOp(t *testing.T) {
 	if n := len(e.sup.Calls()); n != callsBefore {
 		t.Errorf("supplier calls = %d, want %d: a known update must not be fetched again", n, callsBefore)
 	}
+	e.verify(e.job(first.ID))
 }
 
 func TestResentRecordsUnderNewUpdateAreDuplicates(t *testing.T) {
