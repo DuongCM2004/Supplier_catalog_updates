@@ -594,7 +594,22 @@ Known limits to keep in mind:
 
 ## 7. AI disclosure
 
-(Wording drafted separately and confirmed by the author before submission.)
+This project was built with AI assistance. Exactly how:
+
+- Requirements: the one-day blueprint was brainstormed by the author with an AI assistant and
+  reviewed by the author.
+- Planning: the execution plan (architecture, schema, test plan, task breakdown, risk register)
+  was produced with Claude and reviewed by the author. These planning documents are kept out of
+  this repository by the author's choice.
+- Implementation: the Go code, SQL migration, tests, scripts, Docker/Render configuration and
+  this README were written by Claude Code agents (one lead agent coordinating three parallel
+  agents) following that plan.
+- Decisions by the author: repository name and contents, demo video plus Render deployment,
+  optional API token on write routes, explicit resume after restart, interviewer-readable commit
+  messages, project-local Go toolchain.
+- Verification: every result quoted here comes from running the commands in this repository
+  against real PostgreSQL; an AI code reviewer and the author reviewed the code.
+- The author is responsible for this submission.
 
 ## 8. Demo video and deployment
 
