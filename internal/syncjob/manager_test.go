@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
 	"os"
 	"slices"
@@ -769,5 +770,58 @@ func TestOversizedBatchBlocksTheJobBeforeAnyProductIsWritten(t *testing.T) {
 	}
 	if iss := issues[0]; iss.Code != CodeInvalidBatch || iss.Severity != SeverityBlocking || !strings.Contains(iss.Message, "1001 products") {
 		t.Errorf("issue = %+v, want a BLOCKING INVALID_BATCH that names the 1001 products", iss)
+	}
+}
+
+// mgrLogBuffer collects structured log lines written by worker goroutines.
+type mgrLogBuffer struct {
+	mu  sync.Mutex
+	buf strings.Builder
+}
+
+func (b *mgrLogBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *mgrLogBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// The worker reads the finished job back only to log it, on a context detached from
+// shutdown. Without a deadline of its own a database that stops answering would keep the
+// worker alive for good, Shutdown would time out, and closing the pool would wait with it.
+func TestLogFinishedGivesUpWhenTheDatabaseStopsAnswering(t *testing.T) {
+	pool := testutil.DB(t)
+	testutil.Reset(t, pool)
+	logs := &mgrLogBuffer{}
+	m := NewManager(pool, testutil.NewFakeSupplier(), fastRetryConfig(), Hooks{}, slog.New(slog.NewJSONHandler(logs, nil)))
+
+	ctx := context.Background()
+	lock, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Rollback(ctx) // frees the table even when the test fails below
+	// Every read of sync_jobs from another connection now waits for this transaction.
+	if _, err := lock.Exec(ctx, `LOCK TABLE sync_jobs IN ACCESS EXCLUSIVE MODE`); err != nil {
+		t.Fatal(err)
+	}
+
+	returned := make(chan struct{})
+	go func() {
+		m.logFinished(ctx, "00000000-0000-4000-8000-000000000000", StatusCompleted)
+		close(returned)
+	}()
+	select {
+	case <-returned:
+	case <-time.After(settleTimeout + 2*time.Second):
+		t.Fatalf("logFinished still waiting %s after the database stopped answering: it has no deadline", settleTimeout+2*time.Second)
+	}
+	if out := logs.String(); !strings.Contains(out, `"msg":"job.finished_unreadable"`) {
+		t.Errorf("giving up was not logged:\n%s", out)
 	}
 }

@@ -318,7 +318,11 @@ func (m *Manager) dbFailure(ctx context.Context, jobID string, cursor *string, c
 // logFinished reports a job that left RUNNING through its last batch or the completion
 // check. A completed job also logs its totals.
 func (m *Manager) logFinished(ctx context.Context, jobID string, status Status) {
-	job, err := GetJob(context.WithoutCancel(ctx), m.pool, jobID)
+	// Detached from shutdown so a stop does not lose the log line, bounded so a database that
+	// stopped answering cannot keep the worker, and with it Shutdown, waiting forever.
+	readCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), settleTimeout)
+	defer cancel()
+	job, err := GetJob(readCtx, m.pool, jobID)
 	if err != nil {
 		m.log.Warn("job.finished_unreadable", "job_id", jobID, "status", status, "error", err.Error())
 		return
