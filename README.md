@@ -139,10 +139,16 @@ it elsewhere (the Render deployment sets `DATABASE_URL`, `API_TOKEN` and `SUPPLI
 Invalid values are all reported together and the process exits with status 1 before it
 touches the database. Start-up waits for PostgreSQL, applies the embedded SQL migrations,
 marks any job a previous process left `PENDING` or `RUNNING` as `INTERRUPTED`, and only then
-starts listening. On SIGINT or SIGTERM the server stops accepting connections, lets requests
-in flight finish (up to 10 seconds), stops the sync workers (a running job is saved as
-`INTERRUPTED` with no issue recorded and can be resumed; up to 10 more seconds) and closes the
-database pool.
+starts listening. On SIGINT or SIGTERM the server stops accepting connections and, at the same
+moment, tells the sync workers to stop: a running job is saved as `INTERRUPTED` with no issue
+recorded and can be resumed, normally within a fraction of a second. Requests in flight are
+allowed to finish. The HTTP shutdown and the worker stop share one limit of 8 seconds, so the
+whole stop fits inside Docker's default 10-second grace period, and the database pool is closed
+only after both have finished. A client holding an unused connection open can delay the HTTP
+part by about 5 seconds, never the workers. A second SIGINT or SIGTERM during the stop ends the
+process at once. A request to start or resume a job that is handled while the service stops is
+answered `503 SHUTTING_DOWN`. The server closes a request that takes more than 15 seconds to
+arrive (5 seconds for its headers) and a keep-alive connection that stays idle for 60 seconds.
 
 `GET /healthz` answers `200 {"status":"ok","database":"ok"}`, or
 `503 {"status":"unavailable","database":"error"}` when PostgreSQL does not answer within one
@@ -195,6 +201,11 @@ UTF-8 in text), then applied all-or-nothing in product-key order under row locks
 concurrent writers cannot deadlock. PostgreSQL triggers independently refuse any revision
 decrease or reactivation, so the rules also hold against manual SQL.
 
+A batch of more than 1000 products is refused as `INVALID_BATCH` before the catalog is touched,
+because the batch transaction makes a database round trip per product and would hold its locks
+too long. The same code covers a batch id or next cursor that contains NUL bytes or invalid
+UTF-8, and an update that announces fewer than 1 or more than 2147483647 batches.
+
 ### Job states
 
 | Status | Meaning | What you can do |
@@ -202,8 +213,8 @@ decrease or reactivation, so the rules also hold against manual SQL.
 | `PENDING` | the job exists and its worker is starting | wait |
 | `RUNNING` | a worker is fetching and applying batches | wait |
 | `COMPLETED` | the supplier signalled the end of the feed, every batch is committed, no blocking issue is open | nothing, it is final |
-| `NEEDS_ATTENTION` | a batch was refused (conflicting revisions, invalid record, broken cursor chain, ...); none of that batch was applied and the issue says why | fix the data at the supplier, then resume |
-| `INTERRUPTED` | the supplier stayed unavailable after the retries, PostgreSQL had trouble, or the service was stopped or restarted | resume |
+| `NEEDS_ATTENTION` | a batch was refused (conflicting revisions, invalid record, broken cursor chain, ...) or the database failed in a way that trying again cannot fix (a rejected value or constraint, a defect); none of that batch was applied and the issue says why | fix the data at the supplier or the cause named in the issue, then resume |
+| `INTERRUPTED` | the supplier stayed unavailable after the retries, PostgreSQL was temporarily unavailable or overloaded (connection lost, no free connection, timeout, serialization failure, deadlock), or the service was stopped or restarted | resume |
 | `FAILED` | the supplier does not know that update | nothing, it is final |
 
 Only one job is active (`PENDING` or `RUNNING`) at a time. Starting a different update while one
@@ -346,7 +357,8 @@ HTTP/1.1 409 Conflict
 | 409 | `ACTIVE_JOB_EXISTS` | another job is active; `error.active_job_id` names it when starting |
 | 409 | `INVALID_STATE` | the job cannot be resumed (`COMPLETED`, `FAILED`, or `RUNNING` with a live worker); `error.current_status` says which |
 | 422 | `VALIDATION_FAILED` | a bad `update_id` or `supplier_id`, `limit` outside 1-500, a negative `offset`, an unknown `status`, `type` or `severity` value |
-| 503 | `DB_UNAVAILABLE` | PostgreSQL does not answer; the message never contains connection details |
+| 503 | `DB_UNAVAILABLE` | PostgreSQL does not answer, has no free connection, or cancelled the query (timeout, serialization failure, deadlock): trying again shortly can succeed; the message never contains connection details |
+| 503 | `SHUTTING_DOWN` | `POST /api/syncs` or `POST /api/syncs/{id}/resume` was handled while the service is stopping; nothing was created or resumed, retry after the restart |
 
 `GET /healthz` is the liveness check described under "Server configuration".
 
@@ -591,6 +603,28 @@ Known limits to keep in mind:
   first request afterwards takes about a minute. The free PostgreSQL database expires 30 days
   after it is created (14 days of grace to upgrade, then it is deleted), holds 1 GB and has no
   backups. See "Deploy to Render".
+- **A Render deploy overlaps two instances.** While Render replaces the service, the old and
+  the new instance run side by side for a short time. The new instance's start-up step
+  interrupts a sync that is running; the old worker stops at its next batch without writing
+  anything, because it finds the job no longer `RUNNING`. Resume the job with
+  `POST /api/syncs/{id}/resume` once the deploy has finished and the old instance is gone (a
+  resume while the old worker is still alive would put two workers on one job).
+- **Issues are matched to a batch by cursor.** A blocking issue closes when the batch at its
+  cursor commits, and recording an issue does not check that the cursor is still the job's
+  current position. With one instance only the job's own worker moves the cursor, so that
+  holds. With several instances a stale worker could record an issue at a cursor the job has
+  already passed; it would never close and the job could not complete. Multi-instance use would
+  need a cursor check when an issue is recorded.
+- **The manager's lock covers short database calls.** Starting or resuming a job takes the
+  manager's lock and runs a few quick queries while holding it. That is simple and enough for
+  one active job, but a database that stops answering makes other start and resume requests
+  wait behind it.
+- **`retry_count` has two meanings.** On the first sighting of an issue it is the number of
+  attempts made (for example 4 for a supplier outage, 0 for a rejected batch); each later
+  recurrence of the same problem adds 1.
+- **Error text is public.** Issue `message` and job `last_error` can contain PostgreSQL's own
+  error text (constraint or trigger names, error codes), and the `GET` routes are public. The
+  sensitivity is low, but a deployment that cares should restrict the read routes too.
 
 ## 7. AI disclosure
 
