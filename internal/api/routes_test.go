@@ -645,3 +645,74 @@ func TestGetSyncReturnsTheJobAndAnswers404ForUnknownOrMalformedIds(t *testing.T)
 		rtAssertError(t, rec, http.StatusNotFound, "NOT_FOUND")
 	}
 }
+
+func TestResumeAnswers202ContinuesTheJobAndRefusesWhatCannotBeResumed(t *testing.T) {
+	env := rtNewEnv(t, "")
+	rtServe(env.sup, "UPDATE-1")
+	env.sup.FailTimes("cursor-2", -1)
+	id := env.rtStart(t, "UPDATE-1")
+	env.mgr.Wait() // supplier unavailable at cursor-2: INTERRUPTED after the first batch
+
+	// The supplier is back but hangs, so the resumed job stays RUNNING while it is inspected.
+	env.sup.FailTimes("cursor-2", 0)
+	env.sup.Block("cursor-2")
+	failedFetches := env.sup.FetchCalls("cursor-2")
+
+	rec := env.do(t, http.MethodPost, "/api/syncs/"+id+"/resume", "")
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("resume = %d, want 202: %s", rec.Code, rec.Body.String())
+	}
+	job := routesDecodeBody(t, rec)
+	rtAssertKeys(t, "job", job, rtJobKeys...)
+	if progress := rtObject(t, job, "progress"); job["job_id"] != id || job["status"] != "RUNNING" || progress["processed_batches"] != float64(1) {
+		t.Fatalf("resumed job = %v, want the same job RUNNING with its first batch kept", job)
+	}
+
+	rtWaitForFetches(t, env.sup, "cursor-2", failedFetches+1)
+	errObj := rtAssertError(t, env.do(t, http.MethodPost, "/api/syncs/"+id+"/resume", ""), http.StatusConflict, "INVALID_STATE")
+	if errObj["current_status"] != "RUNNING" {
+		t.Errorf("current_status = %v, want RUNNING for a job whose worker is alive", errObj["current_status"])
+	}
+	rtAssertKeys(t, "invalid state error", errObj, "code", "message", "current_status")
+
+	env.sup.Unblock("cursor-2")
+	env.mgr.Wait()
+	done := routesDecodeBody(t, env.do(t, http.MethodGet, "/api/syncs/"+id, ""))
+	if changes := rtObject(t, done, "changes"); done["status"] != "COMPLETED" || changes["created"] != float64(3) ||
+		changes["updated"] != float64(1) || changes["withdrawn"] != float64(1) || done["last_error"] != nil {
+		t.Fatalf("job after resume = %v, want COMPLETED with the full counters and no leftover error", done)
+	}
+
+	errObj = rtAssertError(t, env.do(t, http.MethodPost, "/api/syncs/"+id+"/resume", ""), http.StatusConflict, "INVALID_STATE")
+	if errObj["current_status"] != "COMPLETED" {
+		t.Errorf("current_status = %v, want COMPLETED", errObj["current_status"])
+	}
+}
+
+func TestResumeAnswers404ForUnknownOrMalformedJobIds(t *testing.T) {
+	env := rtNewEnv(t, "")
+	for _, id := range []string{"00000000-0000-4000-8000-000000000000", "not-a-uuid"} {
+		rtAssertError(t, env.do(t, http.MethodPost, "/api/syncs/"+id+"/resume", ""), http.StatusNotFound, "NOT_FOUND")
+	}
+}
+
+func TestResumeWhileAnotherJobIsActiveAnswers409ActiveJobExists(t *testing.T) {
+	env := rtNewEnv(t, "")
+	rtServe(env.sup, "UPDATE-1")
+	env.sup.FailTimes("cursor-2", -1)
+	stopped := env.rtStart(t, "UPDATE-1")
+	env.mgr.Wait()
+
+	rtServe(env.sup, "UPDATE-2")
+	env.sup.Block("")
+	env.rtStart(t, "UPDATE-2")
+	rtWaitForFetches(t, env.sup, "", 1)
+
+	errObj := rtAssertError(t, env.do(t, http.MethodPost, "/api/syncs/"+stopped+"/resume", ""), http.StatusConflict, "ACTIVE_JOB_EXISTS")
+	rtAssertKeys(t, "active job error", errObj, "code", "message")
+	if got := routesDecodeBody(t, env.do(t, http.MethodGet, "/api/syncs/"+stopped, ""))["status"]; got != "INTERRUPTED" {
+		t.Errorf("refused job status = %v, want it left INTERRUPTED", got)
+	}
+	env.sup.Unblock("")
+	env.mgr.Wait()
+}

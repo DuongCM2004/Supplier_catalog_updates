@@ -345,6 +345,31 @@ func (d Deps) getSync(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, newJobView(job))
 }
 
+// resumeSync continues a stopped job from its saved cursor. The request has no body: the
+// job id says everything, and committed batches are never fetched again.
+func (d Deps) resumeSync(w http.ResponseWriter, r *http.Request) {
+	if !d.requireManager(w, r) {
+		return
+	}
+	id, ok := d.jobIDFromPath(w, r)
+	if !ok {
+		return
+	}
+	job, err := d.Manager.Resume(r.Context(), id)
+	if err != nil {
+		var extra map[string]any
+		if errors.Is(err, syncjob.ErrInvalidTransition) {
+			// "Not allowed" is only actionable together with the state that forbids it.
+			if current, getErr := syncjob.GetJob(r.Context(), d.Pool, id); getErr == nil {
+				extra = map[string]any{"current_status": current.Status}
+			}
+		}
+		d.writeFailure(w, r, err, extra)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, newJobView(job))
+}
+
 // healthz reports whether the database answers within a second, so an orchestrator can
 // tell "process up" from "process up and usable".
 func (d Deps) healthz(w http.ResponseWriter, r *http.Request) {
