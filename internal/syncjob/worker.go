@@ -68,7 +68,8 @@ func (m *Manager) transitionIfPending(ctx context.Context, jobID string) (Job, e
 // over (the job was settled, or settling failed and err says so).
 func (m *Manager) checkUpdate(ctx context.Context, job Job) (stop bool, err error) {
 	var info supplier.UpdateInfo
-	callErr := withRetry(ctx, m.cfg, m.log, "get_update", func(c context.Context) error {
+	retryLog := m.log.With("job_id", job.ID, "update_id", job.UpdateID, "cursor", job.NextCursor)
+	callErr := withRetry(ctx, m.cfg, retryLog, "get_update", func(c context.Context) error {
 		var e error
 		info, e = m.sup.GetUpdate(c, job.UpdateID)
 		return e
@@ -143,7 +144,8 @@ func (m *Manager) runBatches(ctx context.Context, jobID string) error {
 // fetch gets the batch at the job's cursor with bounded retries. stop is true when the run
 // is over and err is the result of settling the job.
 func (m *Manager) fetch(ctx context.Context, job Job) (b supplier.Batch, stop bool, err error) {
-	callErr := withRetry(ctx, m.cfg, m.log, "fetch_batch", func(c context.Context) error {
+	retryLog := m.log.With("job_id", job.ID, "update_id", job.UpdateID, "cursor", job.NextCursor)
+	callErr := withRetry(ctx, m.cfg, retryLog, "fetch_batch", func(c context.Context) error {
 		var e error
 		b, e = m.sup.FetchBatch(c, job.UpdateID, job.NextCursor)
 		return e

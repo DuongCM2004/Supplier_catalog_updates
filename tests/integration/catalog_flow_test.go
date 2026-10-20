@@ -515,8 +515,10 @@ func TestJobEmitsStructuredLifecycleLogs(t *testing.T) {
 		for i, l := range retries {
 			delayMs := 1 << i
 			if l["level"] != "WARN" || l["op"] != "fetch_batch" || l["attempt"] != float64(i+1) ||
-				l["max_attempts"] != float64(4) || l["delay_ms"] != float64(delayMs) || l["error"] == nil {
-				t.Errorf("supplier.retry %d = %v; want WARN fetch_batch attempt %d of 4 with delay_ms %d and the error", i+1, l, i+1, delayMs)
+				l["max_attempts"] != float64(4) || l["delay_ms"] != float64(delayMs) || l["error"] == nil ||
+				l["job_id"] != job.ID || l["cursor"] != flowCursor(2) {
+				t.Errorf("supplier.retry %d = %v; want WARN fetch_batch attempt %d of 4 with delay_ms %d, the error, job_id %s and cursor %s",
+					i+1, l, i+1, delayMs, job.ID, flowCursor(2))
 			}
 		}
 	})
