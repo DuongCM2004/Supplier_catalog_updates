@@ -37,6 +37,8 @@ func NewRouter(d Deps) http.Handler {
 	mux.HandleFunc("POST /api/syncs/{id}/resume", d.resumeSync)
 	mux.HandleFunc("GET /api/syncs/{id}/changes", d.listChanges)
 	mux.HandleFunc("GET /api/syncs/{id}/issues", d.listIssues)
+	mux.HandleFunc("GET /api/products", d.listProducts)
+	mux.HandleFunc("GET /api/products/{product_id}", d.getProduct)
 	return d.requestLog(mux)
 }
 

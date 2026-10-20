@@ -1,6 +1,7 @@
 package api
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -13,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/DuongCM2004/resilient-catalog-sync/internal/catalog"
 	"github.com/DuongCM2004/resilient-catalog-sync/internal/storage"
@@ -487,6 +489,90 @@ func (d Deps) resumeSync(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusAccepted, newJobView(job))
+}
+
+// productView is a stored catalog row. Withdrawn products are tombstones: they keep their
+// revision and report when they were withdrawn.
+type productView struct {
+	SupplierID  string         `json:"supplier_id"`
+	ProductID   string         `json:"product_id"`
+	Status      catalog.Status `json:"status"`
+	Revision    int64          `json:"revision"`
+	Name        *string        `json:"name"`
+	PriceMinor  *int64         `json:"price_minor"`
+	Currency    *string        `json:"currency"`
+	CreatedAt   time.Time      `json:"created_at"`
+	UpdatedAt   time.Time      `json:"updated_at"`
+	WithdrawnAt *time.Time     `json:"withdrawn_at"`
+}
+
+func newProductView(p catalog.Product) productView {
+	return productView{
+		SupplierID: p.SupplierID, ProductID: p.ProductID, Status: p.Status, Revision: p.Revision,
+		Name: p.Name, PriceMinor: p.PriceMinor, Currency: p.Currency,
+		CreatedAt: p.CreatedAt.UTC(), UpdatedAt: p.UpdatedAt.UTC(), WithdrawnAt: utcPtr(p.WithdrawnAt),
+	}
+}
+
+type productListView struct {
+	Items []productView `json:"items"`
+}
+
+// isStorableText reports whether s can be sent to PostgreSQL as text. A NUL byte or invalid
+// UTF-8 in a product or supplier id would make the database refuse the query, which would
+// surface as a server error for what is only a lookup that cannot match anything.
+func isStorableText(s string) bool {
+	return utf8.ValidString(s) && !strings.ContainsRune(s, 0)
+}
+
+// listProducts pages through the catalog ordered by supplier and product id. Only ACTIVE
+// products are listed unless status asks for WITHDRAWN tombstones or ALL.
+func (d Deps) listProducts(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	limit, offset, err := parsePage(q)
+	if err != nil {
+		writeValidation(w, err.Error())
+		return
+	}
+	// The catalog reports an unknown status as a plain error, so it is checked here to keep
+	// a bad filter a 422 and not a 500.
+	status, err := queryChoice(q, "status", string(catalog.StatusActive), string(catalog.StatusWithdrawn), "ALL")
+	if err != nil {
+		writeValidation(w, err.Error())
+		return
+	}
+	if status == "" {
+		status = string(catalog.StatusActive)
+	}
+	supplierID := q.Get("supplier_id")
+	if !isStorableText(supplierID) {
+		writeValidation(w, "supplier_id must be valid text without NUL bytes")
+		return
+	}
+	products, err := catalog.ListProducts(r.Context(), d.Pool,
+		catalog.ListFilter{SupplierID: supplierID, Status: status, Limit: limit, Offset: offset})
+	if err != nil {
+		d.writeFailure(w, r, err, nil)
+		return
+	}
+	writeJSON(w, http.StatusOK, productListView{Items: views(products, newProductView)})
+}
+
+// getProduct returns one product of the configured supplier, or of the supplier_id given.
+// Withdrawn products are returned too: a tombstone is a fact the supplier asserted.
+func (d Deps) getProduct(w http.ResponseWriter, r *http.Request) {
+	productID := r.PathValue("product_id")
+	supplierID := cmp.Or(r.URL.Query().Get("supplier_id"), d.SupplierID)
+	if !isStorableText(productID) || !isStorableText(supplierID) {
+		d.writeFailure(w, r, catalog.ErrNotFound, nil)
+		return
+	}
+	product, err := catalog.GetProduct(r.Context(), d.Pool, supplierID, productID)
+	if err != nil {
+		d.writeFailure(w, r, err, nil)
+		return
+	}
+	writeJSON(w, http.StatusOK, newProductView(product))
 }
 
 // healthz reports whether the database answers within a second, so an orchestrator can

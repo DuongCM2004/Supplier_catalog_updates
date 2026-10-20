@@ -880,3 +880,126 @@ func TestIssuesEndpointShowsSupplierOutageAsTransientWithAttemptCount(t *testing
 		t.Errorf("issue = %v, want SUPPLIER_UNAVAILABLE TRANSIENT at cursor-2 after 2 attempts", it)
 	}
 }
+
+var rtProductKeys = []string{
+	"supplier_id", "product_id", "status", "revision", "name", "price_minor", "currency",
+	"created_at", "updated_at", "withdrawn_at",
+}
+
+// rtProductIDs lists product_id of each product item, in response order.
+func rtProductIDs(items []map[string]any) []string {
+	ids := make([]string, len(items))
+	for i, it := range items {
+		ids[i], _ = it["product_id"].(string)
+	}
+	return ids
+}
+
+// rtCatalogAfterOneSync leaves SKU-1 ACTIVE r2, SKU-2 WITHDRAWN r2 and SKU-3 ACTIVE r1.
+func rtCatalogAfterOneSync(t *testing.T) *rtEnv {
+	t.Helper()
+	env := rtNewEnv(t, "")
+	rtServe(env.sup, "UPDATE-1")
+	env.rtStart(t, "UPDATE-1")
+	env.mgr.Wait()
+	return env
+}
+
+func TestProductsEndpointListsActiveByDefaultAndFiltersByStatusSupplierAndPage(t *testing.T) {
+	env := rtCatalogAfterOneSync(t)
+
+	list := func(query string) []string {
+		t.Helper()
+		rec := env.do(t, http.MethodGet, "/api/products"+query, "")
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET /api/products%s = %d: %s", query, rec.Code, rec.Body.String())
+		}
+		body := routesDecodeBody(t, rec)
+		rtAssertKeys(t, "product list", body, "items")
+		items := rtItems(t, body)
+		for _, it := range items {
+			rtAssertKeys(t, "product item", it, rtProductKeys...)
+		}
+		return rtProductIDs(items)
+	}
+	for query, want := range map[string][]string{
+		"":                             {"SKU-1", "SKU-3"},
+		"?status=ACTIVE":               {"SKU-1", "SKU-3"},
+		"?status=WITHDRAWN":            {"SKU-2"},
+		"?status=ALL":                  {"SKU-1", "SKU-2", "SKU-3"},
+		"?supplier_id=SUP-001":         {"SKU-1", "SKU-3"},
+		"?supplier_id=SUP-999":         {},
+		"?status=ALL&limit=1":          {"SKU-1"},
+		"?status=ALL&limit=1&offset=1": {"SKU-2"},
+		"?limit=1&offset=1":            {"SKU-3"},
+		"?offset=10":                   {},
+	} {
+		if got := list(query); !slices.Equal(got, want) {
+			t.Errorf("GET /api/products%s = %v, want %v", query, got, want)
+		}
+	}
+
+	body := routesDecodeBody(t, env.do(t, http.MethodGet, "/api/products", ""))
+	widget := rtItems(t, body)[0]
+	if widget["supplier_id"] != testutil.SupplierID || widget["status"] != "ACTIVE" || widget["revision"] != float64(2) ||
+		widget["name"] != "Widget" || widget["price_minor"] != float64(1200) || widget["currency"] != "USD" || widget["withdrawn_at"] != nil {
+		t.Errorf("SKU-1 = %v", widget)
+	}
+	for _, field := range []string{"created_at", "updated_at"} {
+		if s, _ := widget[field].(string); !strings.HasSuffix(s, "Z") {
+			t.Errorf("%s = %v, want an RFC 3339 timestamp in UTC", field, widget[field])
+		}
+	}
+
+	empty := env.do(t, http.MethodGet, "/api/products?supplier_id=SUP-999", "")
+	if !strings.Contains(empty.Body.String(), `"items":[]`) {
+		t.Errorf("empty listing = %s, want an empty array, not null", empty.Body.String())
+	}
+}
+
+func TestProductsEndpointRejectsInvalidParametersWith422(t *testing.T) {
+	env := rtNewEnv(t, "")
+	for _, query := range []string{
+		"status=BOGUS", "status=active", "status=ACTIVE,WITHDRAWN", "limit=0", "limit=501", "limit=abc", "offset=-1",
+		"supplier_id=a%00b", "supplier_id=%ff",
+	} {
+		t.Run(query, func(t *testing.T) {
+			rtAssertError(t, env.do(t, http.MethodGet, "/api/products?"+query, ""), http.StatusUnprocessableEntity, "VALIDATION_FAILED")
+		})
+	}
+}
+
+func TestGetProductReturnsTombstonesAndAnswers404ForProductsThatDoNotExist(t *testing.T) {
+	env := rtCatalogAfterOneSync(t)
+
+	get := func(path string) map[string]any {
+		t.Helper()
+		rec := env.do(t, http.MethodGet, path, "")
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET %s = %d: %s", path, rec.Code, rec.Body.String())
+		}
+		product := routesDecodeBody(t, rec)
+		rtAssertKeys(t, "product", product, rtProductKeys...)
+		return product
+	}
+	if p := get("/api/products/SKU-1"); p["product_id"] != "SKU-1" || p["status"] != "ACTIVE" || p["revision"] != float64(2) || p["price_minor"] != float64(1200) {
+		t.Errorf("SKU-1 = %v", p)
+	}
+	if p := get("/api/products/SKU-1?supplier_id=SUP-001"); p["product_id"] != "SKU-1" {
+		t.Errorf("SKU-1 with explicit supplier = %v", p)
+	}
+	tombstone := get("/api/products/SKU-2")
+	if tombstone["status"] != "WITHDRAWN" || tombstone["revision"] != float64(2) || tombstone["withdrawn_at"] == nil {
+		t.Errorf("SKU-2 = %v, want a WITHDRAWN tombstone at revision 2 with withdrawn_at", tombstone)
+	}
+
+	for _, path := range []string{
+		"/api/products/SKU-NOPE",
+		"/api/products/SKU-1?supplier_id=SUP-999",
+		"/api/products/a%00b", // NUL cannot be stored, so it cannot exist; it must not become a 500
+		"/api/products/%ff",
+		"/api/products/SKU-1?supplier_id=%00",
+	} {
+		rtAssertError(t, env.do(t, http.MethodGet, path, ""), http.StatusNotFound, "NOT_FOUND")
+	}
+}
