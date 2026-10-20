@@ -1,9 +1,19 @@
+# Keep the build context to what `go build` and the image need, so editing docs, scripts or
+# tests does not invalidate the cached build layer.
 .git
 .githooks
 .tools
 .env
+.env.example
 Brainstorm
 plans
 bin
+*.exe
+coverage.out
+coverage.html
+*.coverprofile
 tests
+scripts
 *.md
+Makefile
+compose.yaml
