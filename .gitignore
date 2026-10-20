@@ -11,6 +11,9 @@ coverage.html
 # Project-local Go toolchain, module and build caches (see .tools/activate.sh)
 .tools/
 
+# Local notes written by development tooling
+.claude/
+
 # Local configuration (copy from .env.example)
 .env
 
