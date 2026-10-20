@@ -66,7 +66,7 @@ copy and run without make.
 | `DB_PORT` | `55432` | host port of PostgreSQL |
 | `API_TOKEN` | empty | when set, the `POST` routes require `Authorization: Bearer <API_TOKEN>`; reads stay public |
 | `LOG_LEVEL` | `info` | log verbosity |
-| `SUPPLIER_OUTAGE_CURSORS`, `SUPPLIER_DELAY_MS`, `CRASH_POINT` | empty / `0` / empty | failure switches for demos and tests only; see "Tests" |
+| `SUPPLIER_OUTAGE_CURSORS`, `SUPPLIER_DELAY_MS`, `CRASH_POINT` | empty / `0` / empty | failure switches for demos and tests only; described under "Server configuration" |
 
 ### Server configuration
 
@@ -88,12 +88,15 @@ it elsewhere (the Render deployment sets `DATABASE_URL`, `API_TOKEN` and `SUPPLI
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error` |
 | `SUPPLIER_OUTAGE_CURSORS` | empty | demo/test switch: comma-separated cursors on which the supplier always answers "unavailable" |
 | `SUPPLIER_DELAY_MS` | `0` | demo/test switch: pause before every supplier fetch |
-| `CRASH_POINT` | empty | demo/test switch: `before_commit:<batch_id>` or `after_commit:<batch_id>` stops the process at that point |
+| `CRASH_POINT` | empty | demo/test switch: `before_commit:<batch_id>` or `after_commit:<batch_id>` ends the process with exit status 3 at that batch, just before its transaction commits or just after; a malformed value stops start-up with status 1. Restart without it, or the service crashes at the same batch again |
 
 Invalid values are all reported together and the process exits with status 1 before it
-touches the database. Start-up waits for PostgreSQL, applies the embedded SQL migrations and
-only then starts listening. On SIGINT or SIGTERM the server stops accepting connections, lets
-requests in flight finish (up to 10 seconds) and closes the database pool.
+touches the database. Start-up waits for PostgreSQL, applies the embedded SQL migrations,
+marks any job a previous process left `PENDING` or `RUNNING` as `INTERRUPTED`, and only then
+starts listening. On SIGINT or SIGTERM the server stops accepting connections, lets requests
+in flight finish (up to 10 seconds), stops the sync workers (a running job is saved as
+`INTERRUPTED` with no issue recorded and can be resumed; up to 10 more seconds) and closes the
+database pool.
 
 `GET /healthz` answers `200 {"status":"ok","database":"ok"}`, or
 `503 {"status":"unavailable","database":"error"}` when PostgreSQL does not answer within one
@@ -102,7 +105,10 @@ second.
 Logs are JSON on stdout (`docker compose logs app`). `startup.config` shows the effective
 settings with the database password replaced by `xxxxx` and only whether `API_TOKEN` is set,
 never its value; every request logs `http.request` with the method, route pattern, status and
-`duration_ms`.
+`duration_ms`. A sync job logs `job.created`, `job.transition`, one `batch.committed` per
+batch and `job.completed`, and every retried supplier call logs `supplier.retry` with its
+attempt and delay. `startup.reconciled` is logged on every start with the `count` and
+`job_ids` of the jobs it interrupted (an empty list is normal).
 
 ## 3. Using the API
 
@@ -208,10 +214,13 @@ About the supplier (a fictional one, simulated by the files in `fixtures/`):
 
 About how staff drive the service:
 
-- Resuming is explicit. After a restart the service marks jobs it finds `PENDING` or
-  `RUNNING` as `INTERRUPTED` before it accepts requests, but it never continues them by
-  itself. Staff call `POST /api/syncs/{id}/resume`, which continues from the saved cursor. The
-  same call retries a `NEEDS_ATTENTION` job after the source data was corrected.
+- Resuming is explicit. On every start, before it accepts requests, the service marks jobs it
+  finds `PENDING` or `RUNNING` as `INTERRUPTED` (they belonged to a process that is gone), but
+  it never continues them by itself. Staff call `POST /api/syncs/{id}/resume`, which continues
+  from the saved cursor. The same call retries a `NEEDS_ATTENTION` job after the source data
+  was corrected, and takes over a `PENDING` or `RUNNING` job whose worker is gone while the
+  service kept running (for example PostgreSQL was unreachable just when the worker tried to
+  record why it stopped), so that case needs no restart.
 - Posting an update that is already known returns the existing job (`200`, in whatever state
   it is in) and does not start a second one or resume it. Starting and resuming are separate
   actions.
