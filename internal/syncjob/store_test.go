@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/DuongCM2004/resilient-catalog-sync/internal/testutil"
@@ -303,6 +304,56 @@ func TestGetJobReportsOpenBlockingIssuesAndUnknownIds(t *testing.T) {
 		if _, err := GetJob(ctx, pool, id); !errors.Is(err, ErrNotFound) {
 			t.Errorf("GetJob(%q) err = %v, want ErrNotFound", id, err)
 		}
+	}
+}
+
+func TestLockJobHoldsTheRowUntilTheTransactionEnds(t *testing.T) {
+	pool := storeTestPool(t)
+	ctx := context.Background()
+	job := storeMustCreate(t, pool, "UPDATE-1")
+
+	// tryLock asks for the same row lock from another connection without waiting for it.
+	tryLock := func() error {
+		return pgx.BeginFunc(ctx, pool, func(other pgx.Tx) error {
+			_, err := other.Exec(ctx, `SELECT 1 FROM sync_jobs WHERE id = $1::uuid FOR UPDATE NOWAIT`, job.ID)
+			return err
+		})
+	}
+
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }() // after Commit this is a harmless no-op
+	locked, err := lockJob(ctx, tx, job.ID)
+	if err != nil || locked.ID != job.ID || locked.Status != StatusPending {
+		t.Fatalf("lockJob = %+v, %v", locked, err)
+	}
+	var pgErr *pgconn.PgError
+	if err := tryLock(); !errors.As(err, &pgErr) || pgErr.Code != "55P03" {
+		t.Fatalf("second writer err = %v, want lock_not_available while the first holds the job", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := tryLock(); err != nil {
+		t.Fatalf("lock after the first transaction ended: %v", err)
+	}
+}
+
+func TestLockJobOfUnknownIdIsNotFound(t *testing.T) {
+	pool := storeTestPool(t)
+	ctx := context.Background()
+	err := pgx.BeginFunc(ctx, pool, func(tx pgx.Tx) error {
+		for _, id := range []string{"00000000-0000-4000-8000-000000000000", "not-a-uuid", ""} {
+			if _, err := lockJob(ctx, tx, id); !errors.Is(err, ErrNotFound) {
+				t.Errorf("lockJob(%q) err = %v, want ErrNotFound", id, err)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
 }
 
