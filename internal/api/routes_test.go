@@ -716,3 +716,167 @@ func TestResumeWhileAnotherJobIsActiveAnswers409ActiveJobExists(t *testing.T) {
 	env.sup.Unblock("")
 	env.mgr.Wait()
 }
+
+// rtServeBroken makes the fake supplier serve an update whose second batch carries a
+// product with a negative price, so the job stops at cursor-2 with a blocking issue after
+// committing the first batch (SKU-1 created).
+func rtServeBroken(sup *testutil.FakeSupplier, updateID string) {
+	sup.SetUpdate(testutil.Info(updateID, 2))
+	sup.AddPage("", testutil.Page(updateID, "BATCH-1", "cursor-2", true, testutil.Active("SKU-1", 1, "Widget", 1000)))
+	sup.AddPage("cursor-2", testutil.Page(updateID, "BATCH-2", "", false, testutil.Active("SKU-9", 1, "Broken", -5)))
+}
+
+var rtChangeKeys = []string{"id", "batch_id", "supplier_id", "product_id", "revision", "change_type", "before", "after", "created_at"}
+
+var rtIssueKeys = []string{
+	"id", "batch_id", "cursor", "supplier_id", "product_id", "code", "severity", "status", "message",
+	"retry_count", "first_seen_at", "last_seen_at", "resolved_at",
+}
+
+func TestChangesEndpointListsAppliedChangesInOrderWithBeforeAndAfter(t *testing.T) {
+	env := rtNewEnv(t, "")
+	rtServe(env.sup, "UPDATE-1")
+	id := env.rtStart(t, "UPDATE-1")
+	env.mgr.Wait()
+
+	rec := env.do(t, http.MethodGet, "/api/syncs/"+id+"/changes", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("changes = %d: %s", rec.Code, rec.Body.String())
+	}
+	body := routesDecodeBody(t, rec)
+	rtAssertKeys(t, "change list", body, "items")
+	items := rtItems(t, body)
+	var order []string
+	for _, it := range items {
+		rtAssertKeys(t, "change item", it, rtChangeKeys...)
+		order = append(order, fmt.Sprintf("%v %v r%v", it["change_type"], it["product_id"], it["revision"]))
+	}
+	want := []string{"CREATED SKU-1 r1", "CREATED SKU-2 r1", "UPDATED SKU-1 r2", "WITHDRAWN SKU-2 r2", "CREATED SKU-3 r1"}
+	if !slices.Equal(order, want) {
+		t.Fatalf("changes = %v, want %v", order, want)
+	}
+
+	created := items[0]
+	if created["before"] != nil || created["supplier_id"] != testutil.SupplierID || created["batch_id"] != "BATCH-1" {
+		t.Errorf("created change = %v, want a null before-state", created)
+	}
+	if after := rtObject(t, created, "after"); after["status"] != "ACTIVE" || after["revision"] != float64(1) ||
+		after["name"] != "Widget" || after["price_minor"] != float64(1000) || after["currency"] != "USD" {
+		t.Errorf("created after-state = %v", after)
+	}
+	updated := items[2]
+	if before, after := rtObject(t, updated, "before"), rtObject(t, updated, "after"); before["price_minor"] != float64(1000) || after["price_minor"] != float64(1200) {
+		t.Errorf("updated change before/after = %v / %v", before, after)
+	}
+	withdrawn := items[3]
+	if before, after := rtObject(t, withdrawn, "before"), rtObject(t, withdrawn, "after"); before["status"] != "ACTIVE" || after["status"] != "WITHDRAWN" {
+		t.Errorf("withdrawn change before/after = %v / %v", before, after)
+	}
+
+	filtered := routesDecodeBody(t, env.do(t, http.MethodGet, "/api/syncs/"+id+"/changes?type=CREATED", ""))
+	if n := len(rtItems(t, filtered)); n != 3 {
+		t.Errorf("type=CREATED returned %d items, want 3", n)
+	}
+	paged := rtItems(t, routesDecodeBody(t, env.do(t, http.MethodGet, "/api/syncs/"+id+"/changes?limit=2&offset=1", "")))
+	if len(paged) != 2 || paged[0]["product_id"] != "SKU-2" || paged[1]["change_type"] != "UPDATED" {
+		t.Errorf("limit=2&offset=1 returned %v", paged)
+	}
+	past := env.do(t, http.MethodGet, "/api/syncs/"+id+"/changes?offset=50", "")
+	if past.Code != http.StatusOK || !strings.Contains(past.Body.String(), `"items":[]`) {
+		t.Errorf("offset past the end = %d %s, want 200 with an empty array", past.Code, past.Body.String())
+	}
+}
+
+func TestChangesAndIssuesEndpointsRejectBadParametersAndUnknownJobs(t *testing.T) {
+	env := rtNewEnv(t, "")
+	rtServe(env.sup, "UPDATE-1")
+	id := env.rtStart(t, "UPDATE-1")
+	env.mgr.Wait()
+
+	for _, path := range []string{
+		"/changes?type=BOGUS", "/changes?type=created", "/changes?limit=0", "/changes?limit=501", "/changes?offset=-1",
+		"/issues?status=BOGUS", "/issues?status=open", "/issues?severity=BOGUS", "/issues?limit=0", "/issues?offset=x",
+	} {
+		t.Run(path, func(t *testing.T) {
+			rtAssertError(t, env.do(t, http.MethodGet, "/api/syncs/"+id+path, ""), http.StatusUnprocessableEntity, "VALIDATION_FAILED")
+		})
+	}
+	for _, job := range []string{"00000000-0000-4000-8000-000000000000", "not-a-uuid"} {
+		for _, sub := range []string{"/changes", "/issues"} {
+			rtAssertError(t, env.do(t, http.MethodGet, "/api/syncs/"+job+sub, ""), http.StatusNotFound, "NOT_FOUND")
+		}
+	}
+}
+
+func TestIssuesEndpointShowsBlockingIssueThenItsResolutionAfterTheSupplierCorrectsTheBatch(t *testing.T) {
+	env := rtNewEnv(t, "")
+	rtServeBroken(env.sup, "UPDATE-1")
+	id := env.rtStart(t, "UPDATE-1")
+	env.mgr.Wait()
+
+	job := routesDecodeBody(t, env.do(t, http.MethodGet, "/api/syncs/"+id, ""))
+	if job["status"] != "NEEDS_ATTENTION" || job["open_blocking_issues"] != float64(1) || job["last_error"] == nil {
+		t.Fatalf("job = %v, want NEEDS_ATTENTION with one open blocking issue", job)
+	}
+
+	body := routesDecodeBody(t, env.do(t, http.MethodGet, "/api/syncs/"+id+"/issues", ""))
+	rtAssertKeys(t, "issue list", body, "items", "open_blocking")
+	items := rtItems(t, body)
+	if len(items) != 1 || body["open_blocking"] != float64(1) {
+		t.Fatalf("issues = %v, want exactly one with open_blocking 1", body)
+	}
+	issue := items[0]
+	rtAssertKeys(t, "issue item", issue, rtIssueKeys...)
+	if issue["code"] != "INVALID_PRODUCT_DATA" || issue["severity"] != "BLOCKING" || issue["status"] != "OPEN" ||
+		issue["cursor"] != "cursor-2" || issue["retry_count"] != float64(0) || issue["resolved_at"] != nil {
+		t.Errorf("issue = %v", issue)
+	}
+	if msg, _ := issue["message"].(string); !strings.Contains(msg, "SKU-9") {
+		t.Errorf("message %q does not name the offending product", msg)
+	}
+
+	// Filters narrow the items but never the job-level blocking count.
+	for query, wantItems := range map[string]int{
+		"status=OPEN": 1, "status=RESOLVED": 0, "severity=BLOCKING": 1, "severity=TRANSIENT": 0,
+		"status=OPEN&severity=BLOCKING": 1, "status=RESOLVED&severity=BLOCKING": 0,
+	} {
+		filtered := routesDecodeBody(t, env.do(t, http.MethodGet, "/api/syncs/"+id+"/issues?"+query, ""))
+		if n := len(rtItems(t, filtered)); n != wantItems || filtered["open_blocking"] != float64(1) {
+			t.Errorf("?%s = %d items, open_blocking %v; want %d items and 1", query, n, filtered["open_blocking"], wantItems)
+		}
+	}
+
+	// The supplier corrects the batch; resuming commits it and closes the issue.
+	env.sup.AddPage("cursor-2", testutil.Page("UPDATE-1", "BATCH-2", "", false, testutil.Active("SKU-2", 1, "Gadget", 2000)))
+	if rec := env.do(t, http.MethodPost, "/api/syncs/"+id+"/resume", ""); rec.Code != http.StatusAccepted {
+		t.Fatalf("resume = %d: %s", rec.Code, rec.Body.String())
+	}
+	env.mgr.Wait()
+
+	after := routesDecodeBody(t, env.do(t, http.MethodGet, "/api/syncs/"+id+"/issues", ""))
+	resolved := rtItems(t, after)
+	if len(resolved) != 1 || after["open_blocking"] != float64(0) || resolved[0]["status"] != "RESOLVED" || resolved[0]["resolved_at"] == nil {
+		t.Errorf("issues after the correction = %v, want the same issue RESOLVED and open_blocking 0", after)
+	}
+	if got := routesDecodeBody(t, env.do(t, http.MethodGet, "/api/syncs/"+id, ""))["status"]; got != "COMPLETED" {
+		t.Errorf("job status after the correction = %v, want COMPLETED", got)
+	}
+}
+
+func TestIssuesEndpointShowsSupplierOutageAsTransientWithAttemptCount(t *testing.T) {
+	env := rtNewEnv(t, "")
+	rtServe(env.sup, "UPDATE-1")
+	env.sup.FailTimes("cursor-2", -1)
+	id := env.rtStart(t, "UPDATE-1")
+	env.mgr.Wait()
+
+	body := routesDecodeBody(t, env.do(t, http.MethodGet, "/api/syncs/"+id+"/issues?status=OPEN", ""))
+	items := rtItems(t, body)
+	if len(items) != 1 || body["open_blocking"] != float64(0) {
+		t.Fatalf("issues = %v, want one open issue that does not block completion", body)
+	}
+	if it := items[0]; it["code"] != "SUPPLIER_UNAVAILABLE" || it["severity"] != "TRANSIENT" ||
+		it["cursor"] != "cursor-2" || it["retry_count"] != float64(2) {
+		t.Errorf("issue = %v, want SUPPLIER_UNAVAILABLE TRANSIENT at cursor-2 after 2 attempts", it)
+	}
+}

@@ -345,6 +345,125 @@ func (d Deps) getSync(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, newJobView(job))
 }
 
+// changeView is one audit row. before is null when the product did not exist yet; after is
+// the stored state the change produced.
+type changeView struct {
+	ID         string          `json:"id"`
+	BatchID    string          `json:"batch_id"`
+	SupplierID string          `json:"supplier_id"`
+	ProductID  string          `json:"product_id"`
+	Revision   int64           `json:"revision"`
+	ChangeType string          `json:"change_type"`
+	Before     json.RawMessage `json:"before"`
+	After      json.RawMessage `json:"after"`
+	CreatedAt  time.Time       `json:"created_at"`
+}
+
+func newChangeView(c syncjob.Change) changeView {
+	return changeView{
+		ID: c.ID, BatchID: c.BatchID, SupplierID: c.SupplierID, ProductID: c.ProductID,
+		Revision: c.Revision, ChangeType: c.ChangeType, Before: c.Before, After: c.After,
+		CreatedAt: c.CreatedAt.UTC(),
+	}
+}
+
+type changeListView struct {
+	Items []changeView `json:"items"`
+}
+
+// listChanges returns the catalog changes one job applied, in the order they happened.
+func (d Deps) listChanges(w http.ResponseWriter, r *http.Request) {
+	id, ok := d.jobIDFromPath(w, r)
+	if !ok {
+		return
+	}
+	q := r.URL.Query()
+	limit, offset, err := parsePage(q)
+	if err != nil {
+		writeValidation(w, err.Error())
+		return
+	}
+	changeType, err := queryChoice(q, "type", "CREATED", "UPDATED", "WITHDRAWN")
+	if err != nil {
+		writeValidation(w, err.Error())
+		return
+	}
+	changes, err := syncjob.ListChanges(r.Context(), d.Pool, id, changeType, limit, offset)
+	if err != nil {
+		d.writeFailure(w, r, err, nil)
+		return
+	}
+	writeJSON(w, http.StatusOK, changeListView{Items: views(changes, newChangeView)})
+}
+
+type issueView struct {
+	ID          string            `json:"id"`
+	BatchID     *string           `json:"batch_id"`
+	Cursor      *string           `json:"cursor"`
+	SupplierID  *string           `json:"supplier_id"`
+	ProductID   *string           `json:"product_id"`
+	Code        syncjob.IssueCode `json:"code"`
+	Severity    syncjob.Severity  `json:"severity"`
+	Status      string            `json:"status"`
+	Message     string            `json:"message"`
+	RetryCount  int               `json:"retry_count"`
+	FirstSeenAt time.Time         `json:"first_seen_at"`
+	LastSeenAt  time.Time         `json:"last_seen_at"`
+	ResolvedAt  *time.Time        `json:"resolved_at"`
+}
+
+func newIssueView(i syncjob.Issue) issueView {
+	return issueView{
+		ID: i.ID, BatchID: i.BatchID, Cursor: i.Cursor, SupplierID: i.SupplierID, ProductID: i.ProductID,
+		Code: i.Code, Severity: i.Severity, Status: i.Status, Message: i.Message, RetryCount: i.RetryCount,
+		FirstSeenAt: i.FirstSeenAt.UTC(), LastSeenAt: i.LastSeenAt.UTC(), ResolvedAt: utcPtr(i.ResolvedAt),
+	}
+}
+
+// issueListView carries the job's open blocking count next to the (possibly filtered)
+// items, so the one number that decides whether the job can complete is never filtered out.
+type issueListView struct {
+	Items        []issueView `json:"items"`
+	OpenBlocking int         `json:"open_blocking"`
+}
+
+// listIssues returns the problems recorded for one job, oldest first.
+func (d Deps) listIssues(w http.ResponseWriter, r *http.Request) {
+	id, ok := d.jobIDFromPath(w, r)
+	if !ok {
+		return
+	}
+	q := r.URL.Query()
+	limit, offset, err := parsePage(q)
+	if err != nil {
+		writeValidation(w, err.Error())
+		return
+	}
+	status, err := queryChoice(q, "status", "OPEN", "RESOLVED")
+	if err != nil {
+		writeValidation(w, err.Error())
+		return
+	}
+	severity, err := queryChoice(q, "severity", string(syncjob.SeverityBlocking), string(syncjob.SeverityTransient))
+	if err != nil {
+		writeValidation(w, err.Error())
+		return
+	}
+	// The count and the page are two reads; a commit between them can make them differ for
+	// one response, which the next poll corrects.
+	job, err := syncjob.GetJob(r.Context(), d.Pool, id)
+	if err != nil {
+		d.writeFailure(w, r, err, nil)
+		return
+	}
+	issues, err := syncjob.ListIssues(r.Context(), d.Pool, id, status, severity, limit, offset)
+	if err != nil {
+		d.writeFailure(w, r, err, nil)
+		return
+	}
+	writeJSON(w, http.StatusOK, issueListView{Items: views(issues, newIssueView), OpenBlocking: job.OpenBlockingIssues})
+}
+
 // resumeSync continues a stopped job from its saved cursor. The request has no body: the
 // job id says everything, and committed batches are never fetched again.
 func (d Deps) resumeSync(w http.ResponseWriter, r *http.Request) {
