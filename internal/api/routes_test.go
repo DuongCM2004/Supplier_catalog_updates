@@ -1064,3 +1064,33 @@ func TestOnlyTheTwoPostRoutesRequireTheBearerToken(t *testing.T) {
 		}
 	}
 }
+
+func TestEveryEndpointAnswers503WithoutLeakingDetailsWhileTheDatabaseIsDown(t *testing.T) {
+	pool := routesUnreachablePool(t)
+	log := slog.New(slog.NewJSONHandler(io.Discard, nil))
+	mgr := syncjob.NewManager(pool, testutil.NewFakeSupplier(), syncjob.Config{}, syncjob.Hooks{}, log)
+	h := NewRouter(Deps{Pool: pool, Log: log, Manager: mgr, SupplierID: testutil.SupplierID})
+	job := "00000000-0000-4000-8000-000000000000"
+
+	for _, tc := range []struct{ method, path, body string }{
+		{http.MethodPost, "/api/syncs", `{"update_id":"UPDATE-1"}`},
+		{http.MethodGet, "/api/syncs", ""},
+		{http.MethodGet, "/api/syncs/" + job, ""},
+		{http.MethodPost, "/api/syncs/" + job + "/resume", ""},
+		{http.MethodGet, "/api/syncs/" + job + "/changes", ""},
+		{http.MethodGet, "/api/syncs/" + job + "/issues", ""},
+		{http.MethodGet, "/api/products", ""},
+		{http.MethodGet, "/api/products/SKU-1", ""},
+	} {
+		t.Run(tc.method+" "+tc.path, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, httptest.NewRequest(tc.method, tc.path, strings.NewReader(tc.body)))
+			rtAssertError(t, rec, http.StatusServiceUnavailable, "DB_UNAVAILABLE")
+			for _, secret := range []string{"nothing", "nobody", "127.0.0.1"} {
+				if strings.Contains(rec.Body.String(), secret) {
+					t.Errorf("response leaks %q: %s", secret, rec.Body.String())
+				}
+			}
+		})
+	}
+}
