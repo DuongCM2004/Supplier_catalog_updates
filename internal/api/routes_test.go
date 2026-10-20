@@ -1003,3 +1003,64 @@ func TestGetProductReturnsTombstonesAndAnswers404ForProductsThatDoNotExist(t *te
 		rtAssertError(t, env.do(t, http.MethodGet, path, ""), http.StatusNotFound, "NOT_FOUND")
 	}
 }
+
+// rtToken is a throwaway value used only by these tests.
+const rtToken = "throwaway-test-token"
+
+func TestOnlyTheTwoPostRoutesRequireTheBearerToken(t *testing.T) {
+	env := rtNewEnv(t, rtToken)
+	rtServe(env.sup, "UPDATE-1")
+	unknown := "00000000-0000-4000-8000-000000000000"
+
+	// Rejected before the body is parsed: a body that would be 400 and a job id that would
+	// be 404 both come back 401.
+	for _, tc := range []struct{ name, path, body string }{
+		{"start with invalid JSON", "/api/syncs", `{"update_id":`},
+		{"start with a valid body", "/api/syncs", `{"update_id":"UPDATE-1"}`},
+		{"resume of an unknown job", "/api/syncs/" + unknown + "/resume", ""},
+		{"resume of a malformed id", "/api/syncs/not-a-uuid/resume", ""},
+	} {
+		for header, value := range map[string]string{
+			"missing token": "", "wrong token": "Bearer not-the-token", "wrong scheme": "Basic " + rtToken, "token without scheme": rtToken,
+		} {
+			t.Run(tc.name+"/"+header, func(t *testing.T) {
+				var rec *httptest.ResponseRecorder
+				if value == "" {
+					rec = env.do(t, http.MethodPost, tc.path, tc.body)
+				} else {
+					rec = env.do(t, http.MethodPost, tc.path, tc.body, "Authorization", value)
+				}
+				rtAssertError(t, rec, http.StatusUnauthorized, "UNAUTHORIZED")
+				if rec.Header().Get("WWW-Authenticate") != "Bearer" {
+					t.Errorf("WWW-Authenticate = %q, want Bearer", rec.Header().Get("WWW-Authenticate"))
+				}
+				if strings.Contains(rec.Body.String(), rtToken) {
+					t.Errorf("response echoes the token: %s", rec.Body.String())
+				}
+			})
+		}
+	}
+	if n := rtCountJobs(t, env.pool); n != 0 {
+		t.Fatalf("rejected requests created %d jobs", n)
+	}
+
+	auth := []string{"Authorization", "Bearer " + rtToken}
+	rtAssertError(t, env.do(t, http.MethodPost, "/api/syncs", `{"update_id":`, auth...), http.StatusBadRequest, "INVALID_JSON")
+	rtAssertError(t, env.do(t, http.MethodPost, "/api/syncs/"+unknown+"/resume", "", auth...), http.StatusNotFound, "NOT_FOUND")
+	rec := env.do(t, http.MethodPost, "/api/syncs", `{"update_id":"UPDATE-1"}`, auth...)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("start with the right token = %d, want 202: %s", rec.Code, rec.Body.String())
+	}
+	id, _ := routesDecodeBody(t, rec)["job_id"].(string)
+	env.mgr.Wait()
+
+	// Every read stays public.
+	for _, path := range []string{
+		"/healthz", "/api/syncs", "/api/syncs/" + id, "/api/syncs/" + id + "/changes", "/api/syncs/" + id + "/issues",
+		"/api/products", "/api/products/SKU-1",
+	} {
+		if rec := env.do(t, http.MethodGet, path, ""); rec.Code != http.StatusOK {
+			t.Errorf("GET %s without a token = %d, want 200: %s", path, rec.Code, rec.Body.String())
+		}
+	}
+}
