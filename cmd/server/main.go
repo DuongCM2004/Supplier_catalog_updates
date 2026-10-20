@@ -27,8 +27,16 @@ import (
 )
 
 const (
+	// The request limits stop a slow or silent client from pinning a goroutine and a
+	// connection. There is no WriteTimeout: responses are small, and a write that stalls
+	// ends with the client's connection.
 	readHeaderTimeout = 5 * time.Second
-	shutdownTimeout   = 10 * time.Second
+	readTimeout       = 15 * time.Second // whole request, body included (bodies are at most 1 MiB)
+	idleTimeout       = 60 * time.Second // keep-alive connection waiting for its next request
+	// shutdownTimeout is the one deadline for stopping the HTTP server and the sync workers
+	// together. It is shorter than Docker's default 10 s stop grace so that closing the
+	// database pool and exiting still finish before SIGKILL.
+	shutdownTimeout = 8 * time.Second
 )
 
 // config is the whole process configuration, read once from the environment at startup.
@@ -58,6 +66,13 @@ func main() {
 
 	// A stop signal during the (possibly long) wait for PostgreSQL ends that wait too.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	// After the first signal the handler is released, so a second SIGINT or SIGTERM during
+	// the (up to shutdownTimeout long) graceful stop ends the process at once instead of
+	// being swallowed. Without this stop() would only run once run has returned.
+	go func() {
+		<-ctx.Done()
+		stop()
+	}()
 	err = run(ctx, cfg, log)
 	stop()
 	if err != nil {
@@ -107,8 +122,6 @@ func run(ctx context.Context, cfg config, log *slog.Logger) error {
 	}
 	mgr := syncjob.NewManager(pool, supplier.NewFixtureClient(cfg.FixturesDir, cfg.Faults), cfg.Retry,
 		crash.hooks(log, os.Exit), log)
-	// Registered after the pool's Close, so it runs first: workers stop before their pool goes.
-	defer stopManager(mgr, log)
 
 	// Jobs left PENDING/RUNNING by a previous process have no worker. They are marked
 	// INTERRUPTED before the listener opens so no request can see or resume a stale state.
@@ -116,16 +129,13 @@ func run(ctx context.Context, cfg config, log *slog.Logger) error {
 		return fmt.Errorf("reconcile jobs: %w", err)
 	}
 
-	srv := &http.Server{
-		Handler: api.NewRouter(api.Deps{
-			Pool:       pool,
-			Log:        log,
-			Manager:    mgr,
-			SupplierID: cfg.SupplierID,
-			APIToken:   cfg.APIToken,
-		}),
-		ReadHeaderTimeout: readHeaderTimeout,
-	}
+	srv := newHTTPServer(api.NewRouter(api.Deps{
+		Pool:       pool,
+		Log:        log,
+		Manager:    mgr,
+		SupplierID: cfg.SupplierID,
+		APIToken:   cfg.APIToken,
+	}))
 	ln, err := net.Listen("tcp", cfg.HTTPAddr)
 	if err != nil {
 		return fmt.Errorf("listen on %s: %w", cfg.HTTPAddr, err)
@@ -134,18 +144,45 @@ func run(ctx context.Context, cfg config, log *slog.Logger) error {
 
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- srv.Serve(ln) }()
+	// Only an API request starts a worker, so none exists before this point and the early
+	// returns above have nothing to stop. From here every way out goes through stopServing,
+	// and the pool's deferred Close runs after it: the pool outlives the workers.
 	select {
 	case err := <-serveErr:
-		return fmt.Errorf("http server: %w", err)
+		return errors.Join(fmt.Errorf("http server: %w", err), stopServing(srv, mgr, log))
 	case <-ctx.Done():
 	}
-
-	// Stop accepting and let in-flight requests finish; then (deferred) interrupt the
-	// workers so their jobs can be resumed, and only then close the pool.
 	log.Info("server.stopping")
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	return stopServing(srv, mgr, log)
+}
+
+// newHTTPServer is the server with the request and keep-alive limits above.
+func newHTTPServer(h http.Handler) *http.Server {
+	return &http.Server{
+		Handler:           h,
+		ReadHeaderTimeout: readHeaderTimeout,
+		ReadTimeout:       readTimeout,
+		IdleTimeout:       idleTimeout,
+	}
+}
+
+// stopServing stops the HTTP server and the sync workers at the same time, both bounded by
+// one shutdownTimeout, and returns when both are done.
+//
+// The workers must not wait for the HTTP server. srv.Shutdown returns only once every
+// connection is idle, and net/http counts a connection that never carried a request (a
+// pooled client, a browser preconnect, a load balancer probe) as idle only after 5 s. Run
+// one after the other, the job would keep going for those 5 s after the stop signal, and the
+// two waits could add up to more than Docker's stop grace. Manager.Shutdown needs nothing
+// from the listener, so the HTTP shutdown is started first (it stops accepting at once) and
+// the workers are stopped right behind it.
+func stopServing(srv *http.Server, mgr *syncjob.Manager, log *slog.Logger) error {
+	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
-	if err := srv.Shutdown(shutdownCtx); err != nil {
+	httpStopped := make(chan error, 1)
+	go func() { httpStopped <- srv.Shutdown(ctx) }()
+	stopManager(ctx, mgr, log)
+	if err := <-httpStopped; err != nil {
 		return fmt.Errorf("http shutdown: %w", err)
 	}
 	log.Info("server.stopped")
@@ -253,13 +290,11 @@ func redactURL(raw string) string {
 	return u.Redacted()
 }
 
-// stopManager interrupts every running job and waits for the workers, bounded by
-// shutdownTimeout. A job whose worker could not finish in time is left RUNNING with no
-// worker; the next start's reconcile (or a resume) deals with it.
-func stopManager(m *syncjob.Manager, log *slog.Logger) {
+// stopManager interrupts every running job and waits for the workers until ctx ends. A job
+// whose worker could not finish in time is left RUNNING with no worker; the next start's
+// reconcile (or a resume) deals with it.
+func stopManager(ctx context.Context, m *syncjob.Manager, log *slog.Logger) {
 	log.Info("workers.stopping")
-	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
-	defer cancel()
 	if err := m.Shutdown(ctx); err != nil {
 		log.Error("workers.stop_incomplete", "error", err)
 		return

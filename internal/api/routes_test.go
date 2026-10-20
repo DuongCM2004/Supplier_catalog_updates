@@ -187,8 +187,12 @@ func TestErrorStatusMapsDomainAndDatabaseErrors(t *testing.T) {
 		{fmt.Errorf("get product: %w", catalog.ErrNotFound), 404, "NOT_FOUND"},
 		{fmt.Errorf("start: %w", syncjob.ErrActiveJobExists), 409, "ACTIVE_JOB_EXISTS"},
 		{fmt.Errorf("resume: %w", syncjob.ErrInvalidTransition), 409, "INVALID_STATE"},
+		{fmt.Errorf("start: %w", syncjob.ErrShuttingDown), 503, "SHUTTING_DOWN"},
 		{fmt.Errorf("query: %w", &pgconn.PgError{Code: "08006"}), 503, "DB_UNAVAILABLE"},
 		{fmt.Errorf("query: %w", context.DeadlineExceeded), 503, "DB_UNAVAILABLE"},
+		{fmt.Errorf("query: %w", &pgconn.PgError{Code: "53300"}), 503, "DB_UNAVAILABLE"},
+		{fmt.Errorf("query: %w", &pgconn.PgError{Code: "57014"}), 503, "DB_UNAVAILABLE"},
+		{fmt.Errorf("query: %w", &pgconn.PgError{Code: "40001"}), 503, "DB_UNAVAILABLE"},
 		{errors.New("boom: password=hunter2"), 500, "INTERNAL"},
 		{fmt.Errorf("insert: %w", &pgconn.PgError{Code: "23514"}), 500, "INTERNAL"},
 	}
@@ -686,6 +690,34 @@ func TestResumeAnswers202ContinuesTheJobAndRefusesWhatCannotBeResumed(t *testing
 	errObj = rtAssertError(t, env.do(t, http.MethodPost, "/api/syncs/"+id+"/resume", ""), http.StatusConflict, "INVALID_STATE")
 	if errObj["current_status"] != "COMPLETED" {
 		t.Errorf("current_status = %v, want COMPLETED", errObj["current_status"])
+	}
+}
+
+func TestStartAndResumeAnswer503ShuttingDownWhileTheServiceStopsAndReadsKeepWorking(t *testing.T) {
+	env := rtNewEnv(t, "")
+	rtServe(env.sup, "UPDATE-1")
+	env.sup.FailTimes("cursor-2", -1)
+	id := env.rtStart(t, "UPDATE-1")
+	env.mgr.Wait() // INTERRUPTED after the first batch, so a resume would normally be accepted
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := env.mgr.Shutdown(ctx); err != nil {
+		t.Fatalf("shutdown: %v", err)
+	}
+
+	for _, tc := range []struct{ name, path, body string }{
+		{"start", "/api/syncs", `{"update_id":"UPDATE-2"}`},
+		{"resume", "/api/syncs/" + id + "/resume", ""},
+	} {
+		rec := env.do(t, http.MethodPost, tc.path, tc.body)
+		rtAssertError(t, rec, http.StatusServiceUnavailable, "SHUTTING_DOWN")
+	}
+	if n := rtCountJobs(t, env.pool); n != 1 {
+		t.Errorf("sync_jobs rows = %d, want 1: a start refused during shutdown creates no job", n)
+	}
+	if rec := env.do(t, http.MethodGet, "/api/syncs/"+id, ""); rec.Code != http.StatusOK {
+		t.Errorf("GET job while stopping = %d, want 200: reads need no worker", rec.Code)
 	}
 }
 

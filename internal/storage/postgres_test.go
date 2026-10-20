@@ -55,6 +55,43 @@ func TestErrorClassification(t *testing.T) {
 	}
 }
 
+func TestIsRetryableCoversConnectionLoadAndTimingFailuresOnly(t *testing.T) {
+	pg := func(code string) error {
+		return fmt.Errorf("apply batch: %w", &pgconn.PgError{Code: code, Message: "boom"})
+	}
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"no error", nil, false},
+		{"connection exception", pg("08006"), true},
+		{"server shutting down", pg("57P01"), true},
+		{"network failure", fmt.Errorf("query: %w", &net.OpError{Op: "read", Err: errors.New("connection reset")}), true},
+		{"database call timed out", fmt.Errorf("query: %w", context.DeadlineExceeded), true},
+		{"serialization failure", pg("40001"), true},
+		{"deadlock", pg("40P01"), true},
+		{"too many connections", pg("53300"), true},
+		{"disk full", pg("53100"), true},
+		{"statement timeout", pg("57014"), true},
+		{"data exception", pg("22003"), false},
+		{"NUL byte in text", pg("22021"), false},
+		{"check violation", pg("23514"), false},
+		{"undefined column", pg("42703"), false},
+		{"internal error", pg("XX000"), false},
+		{"client-side encoding failure", errors.New("unable to encode 3000000000 into binary format for int4 (OID 23)"), false},
+		{"shutdown cancellation", fmt.Errorf("query: %w", context.Canceled), false},
+		{"no row", fmt.Errorf("get job: %w", pgx.ErrNoRows), false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := storage.IsRetryable(tc.err); got != tc.want {
+				t.Errorf("IsRetryable(%v) = %t, want %t", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
 // The classifier must agree with what PostgreSQL really reports, not only with the codes
 // this file assumes.
 func TestErrorClassificationMatchesRealDatabaseFailures(t *testing.T) {

@@ -9,11 +9,13 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/DuongCM2004/resilient-catalog-sync/internal/supplier"
 	"github.com/DuongCM2004/resilient-catalog-sync/internal/syncjob"
 	"github.com/DuongCM2004/resilient-catalog-sync/internal/testutil"
 )
@@ -283,8 +285,17 @@ func (b *lockedBuffer) String() string {
 // function that stops it gracefully and returns what run returned.
 func startServer(t *testing.T) (logs *lockedBuffer, stop func() error) {
 	t.Helper()
-	addr := freeAddr(t)
-	cfg := config{DatabaseURL: os.Getenv("TEST_DATABASE_URL"), DBWait: 5 * time.Second, HTTPAddr: addr, SupplierID: "SUP-001"}
+	_, logs, stop = startServerWith(t, config{})
+	return logs, stop
+}
+
+// startServerWith is startServer for a config that sets only what a test varies (fixtures,
+// faults, retry); the database, wait, address and supplier are always the test defaults.
+// It also returns the address the server listens on.
+func startServerWith(t *testing.T, cfg config) (addr string, logs *lockedBuffer, stop func() error) {
+	t.Helper()
+	addr = freeAddr(t)
+	cfg.DatabaseURL, cfg.DBWait, cfg.HTTPAddr, cfg.SupplierID = os.Getenv("TEST_DATABASE_URL"), 5*time.Second, addr, "SUP-001"
 	logs = &lockedBuffer{}
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
@@ -307,7 +318,7 @@ func startServer(t *testing.T) (logs *lockedBuffer, stop func() error) {
 			t.Fatalf("server never answered on %s: %v", addr, err)
 		}
 	}
-	return logs, func() error {
+	return addr, logs, func() error {
 		cancel()
 		select {
 		case err := <-done:
@@ -382,5 +393,126 @@ func TestRunLogsReconcileOnEveryStartEvenWhenNothingWasLeftActive(t *testing.T) 
 	}
 	if err := stop(); err != nil {
 		t.Fatalf("graceful stop returned %v, want nil", err)
+	}
+}
+
+// A pooled client, a browser preconnect or a load balancer health probe can hold a
+// connection that never carried a request. net/http counts such a connection as idle only
+// after 5 s, so http.Server.Shutdown can take that long to return. The workers must not wait
+// for it: a running job has to be saved as INTERRUPTED right after the stop signal, and the
+// whole stop has to end inside Docker's default 10 s stop grace.
+func TestRunStopsWorkersAtOnceWhileAnIdleConnectionDelaysTheHTTPShutdown(t *testing.T) {
+	const (
+		feedDelay       = time.Second      // pause before every batch: the job is still mid-run when the signal comes
+		interruptWithin = 2 * time.Second  // well under the 5 s idle-connection wait
+		dockerStopGrace = 10 * time.Second // what `docker stop` allows before SIGKILL
+	)
+	if shutdownTimeout >= dockerStopGrace {
+		t.Fatalf("shutdownTimeout = %s leaves no time to close the pool inside Docker's %s stop grace", shutdownTimeout, dockerStopGrace)
+	}
+	pool := testutil.DB(t)
+	testutil.Reset(t, pool)
+
+	addr, logs, stop := startServerWith(t, config{
+		FixturesDir: filepath.Join("..", "..", "fixtures"),
+		Faults:      supplier.FaultOptions{Delay: feedDelay},
+	})
+
+	client := &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{DisableKeepAlives: true}}
+	resp, err := client.Post("http://"+addr+"/api/syncs", "application/json", strings.NewReader(`{"update_id":"UPDATE-2026-003"}`))
+	if err != nil {
+		t.Fatalf("start sync: %v", err)
+	}
+	var started struct {
+		JobID string `json:"job_id"`
+	}
+	err = json.NewDecoder(resp.Body).Decode(&started)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusAccepted || err != nil || started.JobID == "" {
+		t.Fatalf("start sync = %d, job %q, decode error %v; want 202 and a job id", resp.StatusCode, started.JobID, err)
+	}
+
+	// Mid-run: at least one batch is saved, the next fetch is waiting out its delay.
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		var processed int
+		if err := pool.QueryRow(context.Background(), `SELECT processed_batches FROM sync_jobs WHERE id = $1::uuid`, started.JobID).Scan(&processed); err != nil {
+			t.Fatal(err)
+		}
+		if processed >= 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no batch was saved within 15 s\n%s", logs.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	idle, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer idle.Close()
+	time.Sleep(200 * time.Millisecond) // let the accept loop take the connection; it never sends a request
+
+	cancelledAt := time.Now()
+	stopped := make(chan error, 1)
+	go func() { stopped <- stop() }() // cancels the run context and waits for run to return
+
+	// Nothing below may end the test before run has returned, or a still-running server
+	// would write to the database under the next test.
+	var status string
+	var statusErr error
+	var interruptedAfter time.Duration
+	for {
+		interruptedAfter = time.Since(cancelledAt)
+		statusErr = pool.QueryRow(context.Background(), `SELECT status FROM sync_jobs WHERE id = $1::uuid`, started.JobID).Scan(&status)
+		if statusErr != nil || status != "RUNNING" || interruptedAfter > interruptWithin {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	runErr := <-stopped
+	returnedAfter := time.Since(cancelledAt)
+	t.Logf("job %s %s after the stop signal; run returned after %s", status, interruptedAfter.Round(time.Millisecond), returnedAfter.Round(time.Millisecond))
+
+	if statusErr != nil {
+		t.Fatalf("read job status: %v", statusErr)
+	}
+	if status != "INTERRUPTED" || interruptedAfter > interruptWithin {
+		t.Errorf("job = %s after %s, want INTERRUPTED within %s of the stop signal: the workers must not wait for the HTTP shutdown", status, interruptedAfter, interruptWithin)
+	}
+	var issues int
+	var lastError *string
+	if err := pool.QueryRow(context.Background(), `SELECT (SELECT count(*) FROM sync_issues), (SELECT last_error FROM sync_jobs WHERE id = $1::uuid)`, started.JobID).Scan(&issues, &lastError); err != nil {
+		t.Fatal(err)
+	}
+	if issues != 0 || lastError == nil || !strings.Contains(*lastError, "shutting down") {
+		t.Errorf("after a requested stop: %d issue rows, last_error %v; want none and a shutting-down reason", issues, lastError)
+	}
+
+	if runErr != nil {
+		t.Errorf("run returned %v, want nil", runErr)
+	}
+	if returnedAfter >= dockerStopGrace {
+		t.Errorf("run returned %s after the stop signal, want less than Docker's %s stop grace", returnedAfter, dockerStopGrace)
+	}
+	out := logs.String()
+	workersStopped, serverStopped := strings.Index(out, `"msg":"workers.stopped"`), strings.Index(out, `"msg":"server.stopped"`)
+	if workersStopped < 0 || serverStopped < 0 || workersStopped > serverStopped {
+		t.Errorf("want workers.stopped logged before server.stopped (the idle connection holds the HTTP shutdown back):\n%s", out)
+	}
+}
+
+// Without a ReadTimeout a client that sends part of a body and then goes quiet, and without
+// an IdleTimeout a keep-alive client that never sends another request, hold a goroutine and
+// a connection for as long as they like.
+func TestHTTPServerBoundsSlowAndIdleClients(t *testing.T) {
+	srv := newHTTPServer(http.NotFoundHandler())
+	if srv.ReadHeaderTimeout != 5*time.Second || srv.ReadTimeout != 15*time.Second || srv.IdleTimeout != 60*time.Second {
+		t.Errorf("read header %s, read %s, idle %s; want 5s, 15s and 60s", srv.ReadHeaderTimeout, srv.ReadTimeout, srv.IdleTimeout)
+	}
+	if srv.ReadTimeout < srv.ReadHeaderTimeout {
+		t.Errorf("ReadTimeout %s is shorter than ReadHeaderTimeout %s, which it includes", srv.ReadTimeout, srv.ReadHeaderTimeout)
 	}
 }

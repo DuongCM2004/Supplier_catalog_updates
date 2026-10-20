@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -85,9 +86,11 @@ func (m *Manager) checkUpdate(ctx context.Context, job Job) (stop bool, err erro
 	case info.SupplierID != job.SupplierID:
 		return true, m.blockJob(ctx, job.ID, CodeInvalidBatch, cursor,
 			fmt.Sprintf("update %q belongs to supplier %.80q, but this job syncs supplier %q", job.UpdateID, info.SupplierID, job.SupplierID))
-	case info.TotalBatches != nil && *info.TotalBatches < 1:
+	case info.TotalBatches != nil && (*info.TotalBatches < 1 || *info.TotalBatches > math.MaxInt32):
+		// The upper bound is the width of the total_batches column: a larger number fails to
+		// encode on every attempt, which is the supplier's mistake, not a database outage.
 		return true, m.blockJob(ctx, job.ID, CodeInvalidBatch, cursor,
-			fmt.Sprintf("supplier announced %d batches", *info.TotalBatches))
+			fmt.Sprintf("supplier announced %d batches, expected 1 to %d", *info.TotalBatches, math.MaxInt32))
 	}
 	if err := setTotalBatchesIfUnknown(ctx, m.pool, job.ID, info.TotalBatches); err != nil {
 		return true, m.dbFailure(ctx, job.ID, &cursor, err)
@@ -291,17 +294,19 @@ func (m *Manager) fail(ctx context.Context, jobID string, code IssueCode, cursor
 	return m.settle(ctx, jobID, &iss, StatusFailed, message)
 }
 
-// dbFailure handles a database error the run cannot continue from. A connection-class
-// error is transient: the job is interrupted and can be resumed. A data error (a constraint
-// or trigger refusal) would fail the same way every time, so it blocks the job instead.
-// A nil cursor means "wherever the job is now".
+// dbFailure handles a database error the run cannot continue from. Only an error that a
+// later attempt can get past (storage.IsRetryable: the connection, load or timing) is
+// transient: the job is interrupted and can be resumed. Anything else (a constraint or
+// trigger refusal, a client-side encoding failure, a bug) would fail the same way on every
+// resume, so it blocks the job for attention instead of inviting a resume loop. A nil
+// cursor means "wherever the job is now".
 func (m *Manager) dbFailure(ctx context.Context, jobID string, cursor *string, cause error) error {
 	if ctx.Err() != nil {
 		return m.interrupt(ctx, jobID, nil)
 	}
 	iss := Issue{Code: CodeDatabaseError, Severity: SeverityTransient, Cursor: cursor, Message: "database error: " + cause.Error()}
 	to := StatusInterrupted
-	if storage.IsDataError(cause) {
+	if !storage.IsRetryable(cause) {
 		iss.Severity, to = SeverityBlocking, StatusNeedsAttention
 	}
 	if err := m.settle(ctx, jobID, &iss, to, iss.Message); err != nil {
@@ -313,7 +318,11 @@ func (m *Manager) dbFailure(ctx context.Context, jobID string, cursor *string, c
 // logFinished reports a job that left RUNNING through its last batch or the completion
 // check. A completed job also logs its totals.
 func (m *Manager) logFinished(ctx context.Context, jobID string, status Status) {
-	job, err := GetJob(context.WithoutCancel(ctx), m.pool, jobID)
+	// Detached from shutdown so a stop does not lose the log line, bounded so a database that
+	// stopped answering cannot keep the worker, and with it Shutdown, waiting forever.
+	readCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), settleTimeout)
+	defer cancel()
+	job, err := GetJob(readCtx, m.pool, jobID)
 	if err != nil {
 		m.log.Warn("job.finished_unreadable", "job_id", jobID, "status", status, "error", err.Error())
 		return

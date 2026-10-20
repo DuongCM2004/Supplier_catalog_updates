@@ -82,7 +82,9 @@ func errorStatus(err error) (status int, code, message string) {
 		return http.StatusConflict, "ACTIVE_JOB_EXISTS", "another sync job is active"
 	case errors.Is(err, syncjob.ErrInvalidTransition):
 		return http.StatusConflict, "INVALID_STATE", "the job is not in a state that allows this operation"
-	case storage.IsConnectionError(err):
+	case errors.Is(err, syncjob.ErrShuttingDown):
+		return http.StatusServiceUnavailable, "SHUTTING_DOWN", "the service is shutting down, retry after it has restarted"
+	case storage.IsRetryable(err): // connection loss, but also 53300 too many connections, 57014 statement timeout
 		return http.StatusServiceUnavailable, "DB_UNAVAILABLE", "database unavailable, retry shortly"
 	}
 	return http.StatusInternalServerError, "INTERNAL", "internal error"
@@ -95,7 +97,9 @@ func (d Deps) writeFailure(w http.ResponseWriter, r *http.Request, err error, ex
 	case http.StatusInternalServerError:
 		d.Log.Error("http.error", "method", r.Method, "path", r.URL.Path, "error", err)
 	case http.StatusServiceUnavailable:
-		d.Log.Warn("http.database_unavailable", "method", r.Method, "path", r.URL.Path, "error", err)
+		if code == "DB_UNAVAILABLE" { // a refusal during shutdown is expected, not a database problem
+			d.Log.Warn("http.database_unavailable", "method", r.Method, "path", r.URL.Path, "error", err)
+		}
 	}
 	writeError(w, status, code, message, extra)
 }

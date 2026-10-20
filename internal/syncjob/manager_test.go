@@ -3,16 +3,22 @@ package syncjob
 import (
 	"context"
 	"errors"
+	"fmt"
+	"log/slog"
+	"math"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/DuongCM2004/resilient-catalog-sync/internal/catalog"
 	"github.com/DuongCM2004/resilient-catalog-sync/internal/supplier"
 	"github.com/DuongCM2004/resilient-catalog-sync/internal/testutil"
 )
@@ -551,4 +557,271 @@ func TestResumeReturnsTheRunningSnapshotEvenWhenTheWorkerFinishesFirst(t *testin
 			t.Fatalf("job ended %s, want COMPLETED: the worker must run although the read failed", got.Status)
 		}
 	})
+}
+
+// A request that is being handled when the service starts to stop must not add a worker
+// after Shutdown began waiting for them, nor start one on a context that is already
+// cancelled.
+func TestStartAndResumeAreRefusedOnceShutdownBegan(t *testing.T) {
+	env := mgrSetup(t, Hooks{})
+	env.sup.SetUpdate(testutil.Info("UPDATE-2", 1))
+	env.sup.Block("")
+	started := mgrStart(t, env.m, mgrUpdate)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := env.m.Shutdown(ctx); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+	if job := mgrJob(t, env.pool, started.ID); job.Status != StatusInterrupted {
+		t.Fatalf("job after Shutdown = %s, want INTERRUPTED", job.Status)
+	}
+
+	if job, created, err := env.m.Start(ctx, testutil.SupplierID, "UPDATE-2"); !errors.Is(err, ErrShuttingDown) || created || job.ID != "" {
+		t.Errorf("Start after Shutdown = job %q, created %v, err %v; want ErrShuttingDown and nothing created", job.ID, created, err)
+	}
+	if _, err := env.m.Resume(ctx, started.ID); !errors.Is(err, ErrShuttingDown) {
+		t.Errorf("Resume after Shutdown: error = %v, want ErrShuttingDown", err)
+	}
+	if n := storeCount(t, env.pool, `SELECT count(*) FROM sync_jobs`); n != 1 {
+		t.Errorf("sync_jobs rows = %d, want 1: a refused start must not leave a job behind", n)
+	}
+	if job := mgrJob(t, env.pool, started.ID); job.Status != StatusInterrupted {
+		t.Errorf("job after the refused Resume = %s, want it left INTERRUPTED", job.Status)
+	}
+	env.m.Wait() // returns at once: no worker was added after Shutdown
+}
+
+// Shutdown waits for a Start or Resume that is already past its check, which can be stuck on
+// a hung database. That wait must not outlive the caller's deadline, and the workers must
+// still be told to stop.
+func TestShutdownGivesUpWaitingForAStuckStartAtItsDeadline(t *testing.T) {
+	env := mgrSetup(t, Hooks{})
+	env.m.mu.Lock() // what Start holds while its INSERT hangs
+	released := false
+	release := func() {
+		if !released {
+			released = true
+			env.m.mu.Unlock()
+		}
+	}
+	defer release()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	began := time.Now()
+	err := env.m.Shutdown(ctx)
+	if !errors.Is(err, context.DeadlineExceeded) || time.Since(began) > 2*time.Second {
+		t.Fatalf("Shutdown = %v after %s, want the context deadline error at about 100ms", err, time.Since(began))
+	}
+	if env.m.baseCtx.Err() == nil {
+		t.Error("workers were not told to stop although Shutdown gave up waiting")
+	}
+
+	// The sealing goroutine of the Shutdown that gave up completes once the lock is free.
+	release()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		env.m.mu.Lock()
+		closing := env.m.closing
+		env.m.mu.Unlock()
+		if closing {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("Start and Resume were still accepted 5s after the lock was released")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// Only a failure that a later attempt can get past may leave the job INTERRUPTED. One that
+// fails the same way on every resume must park the job for attention, or the operator is
+// told to resume forever.
+func TestOnlyARetryableDatabaseErrorInterruptsTheJob(t *testing.T) {
+	pg := func(code string) error { return &pgconn.PgError{Code: code, Message: "injected"} }
+	tests := []struct {
+		name         string
+		err          error
+		wantStatus   Status
+		wantSeverity Severity
+	}{
+		{"client-side encoding failure", errors.New("unable to encode 3000000000 into binary format for int4 (OID 23)"), StatusNeedsAttention, SeverityBlocking},
+		{"internal error", pg("XX000"), StatusNeedsAttention, SeverityBlocking},
+		{"undefined column", pg("42703"), StatusNeedsAttention, SeverityBlocking},
+		{"data exception", pg("22003"), StatusNeedsAttention, SeverityBlocking},
+		{"serialization failure", pg("40001"), StatusInterrupted, SeverityTransient},
+		{"too many connections", pg("53300"), StatusInterrupted, SeverityTransient},
+		{"statement timeout", pg("57014"), StatusInterrupted, SeverityTransient},
+		{"connection exception", pg("08006"), StatusInterrupted, SeverityTransient},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			env := mgrSetup(t, Hooks{BeforeCommit: func(_ context.Context, _ pgx.Tx, batchID string) error {
+				if batchID == "BATCH-2" {
+					return tc.err
+				}
+				return nil
+			}})
+			job := mgrStart(t, env.m, mgrUpdate)
+			env.m.Wait()
+
+			after := mgrJob(t, env.pool, job.ID)
+			if after.Status != tc.wantStatus || after.ProcessedBatches != 1 || after.NextCursor != "cursor-2" {
+				t.Fatalf("job = %s, %d batches, next %q; want %s after 1 batch at cursor-2", after.Status, after.ProcessedBatches, after.NextCursor, tc.wantStatus)
+			}
+			issues, err := ListIssues(context.Background(), env.pool, job.ID, "", "", 50, 0)
+			if err != nil || len(issues) != 1 {
+				t.Fatalf("issues = %+v, err %v; want exactly one", issues, err)
+			}
+			if iss := issues[0]; iss.Code != CodeDatabaseError || iss.Severity != tc.wantSeverity || iss.Cursor == nil || *iss.Cursor != "cursor-2" {
+				t.Errorf("issue = %+v, want a %s %s at cursor-2", iss, tc.wantSeverity, CodeDatabaseError)
+			}
+		})
+	}
+}
+
+// total_batches is stored in a 32-bit column. A supplier that announces something outside
+// 1 to MaxInt32 is wrong for good, so the job must say so instead of failing to write the
+// number on every attempt and being offered a resume that cannot help.
+func TestImplausibleAnnouncedBatchCountBlocksTheJobAsInvalid(t *testing.T) {
+	for _, total := range []int{0, -5, math.MaxInt32 + 1, 3_000_000_000} {
+		t.Run(strconv.Itoa(total), func(t *testing.T) {
+			env := mgrSetup(t, Hooks{})
+			info := testutil.Info(mgrUpdate, 3)
+			info.TotalBatches = &total
+			env.sup.SetUpdate(info)
+			job := mgrStart(t, env.m, mgrUpdate)
+			env.m.Wait()
+
+			after := mgrJob(t, env.pool, job.ID)
+			if after.Status != StatusNeedsAttention || after.ProcessedBatches != 0 || after.TotalBatches != nil {
+				t.Fatalf("job = %s, %d batches, total %v; want NEEDS_ATTENTION before any batch and no stored total", after.Status, after.ProcessedBatches, after.TotalBatches)
+			}
+			issues, err := ListIssues(context.Background(), env.pool, job.ID, "", "", 50, 0)
+			if err != nil || len(issues) != 1 {
+				t.Fatalf("issues = %+v, err %v; want exactly one", issues, err)
+			}
+			if iss := issues[0]; iss.Code != CodeInvalidBatch || iss.Severity != SeverityBlocking || !strings.Contains(iss.Message, "announced") {
+				t.Errorf("issue = %+v, want a BLOCKING INVALID_BATCH that names the announced count", iss)
+			}
+		})
+	}
+}
+
+// A batch id PostgreSQL cannot store used to end as a DATABASE_ERROR about an INSERT that
+// could not even record its own issue. It is the supplier's malformed batch.
+func TestBatchWithUnstorableTextBlocksTheJobAsInvalidBatch(t *testing.T) {
+	tests := []struct {
+		name        string
+		mutate      func(b *supplier.Batch)
+		wantBatchID bool // the issue names the batch only when its id could be stored
+	}{
+		{"NUL byte in batch id", func(b *supplier.Batch) { b.BatchID = "BATCH\x002" }, false},
+		{"invalid UTF-8 in batch id", func(b *supplier.Batch) { b.BatchID = "BATCH-\xff2" }, false},
+		{"NUL byte in next cursor", func(b *supplier.Batch) { b.NextCursor = "cursor\x003" }, true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			env := mgrSetup(t, Hooks{})
+			page := testutil.Page(mgrUpdate, "BATCH-2", "cursor-3", true, testutil.Active("SKU-9", 1, "Widget", 1000))
+			tc.mutate(&page)
+			env.sup.AddPage("cursor-2", page)
+			job := mgrStart(t, env.m, mgrUpdate)
+			env.m.Wait()
+
+			after := mgrJob(t, env.pool, job.ID)
+			if after.Status != StatusNeedsAttention || after.ProcessedBatches != 1 || after.NextCursor != "cursor-2" {
+				t.Fatalf("job = %s, %d batches, next %q; want NEEDS_ATTENTION after 1 batch at cursor-2", after.Status, after.ProcessedBatches, after.NextCursor)
+			}
+			issues, err := ListIssues(context.Background(), env.pool, job.ID, "", "", 50, 0)
+			if err != nil || len(issues) != 1 {
+				t.Fatalf("issues = %+v, err %v; want exactly one", issues, err)
+			}
+			if iss := issues[0]; iss.Code != CodeInvalidBatch || iss.Severity != SeverityBlocking || (iss.BatchID != nil) != tc.wantBatchID {
+				t.Errorf("issue = %+v, want a BLOCKING INVALID_BATCH (batch id recorded: %v)", iss, tc.wantBatchID)
+			}
+		})
+	}
+}
+
+// A page larger than the ceiling is the supplier's malformed batch. It must be refused
+// before the batch transaction starts, so none of its products touch the catalog.
+func TestOversizedBatchBlocksTheJobBeforeAnyProductIsWritten(t *testing.T) {
+	env := mgrSetup(t, Hooks{})
+	products := make([]catalog.SupplierProduct, maxBatchProducts+1)
+	for i := range products {
+		products[i] = testutil.Active(fmt.Sprintf("BULK-%d", i), 1, "Widget", 100)
+	}
+	env.sup.AddPage("cursor-2", testutil.Page(mgrUpdate, "BATCH-2", "cursor-3", true, products...))
+	job := mgrStart(t, env.m, mgrUpdate)
+	env.m.Wait()
+
+	after := mgrJob(t, env.pool, job.ID)
+	if after.Status != StatusNeedsAttention || after.ProcessedBatches != 1 || after.NextCursor != "cursor-2" {
+		t.Fatalf("job = %s, %d batches, next %q; want NEEDS_ATTENTION after 1 batch at cursor-2", after.Status, after.ProcessedBatches, after.NextCursor)
+	}
+	if n := storeCount(t, env.pool, `SELECT count(*) FROM products`); n != 2 {
+		t.Errorf("products = %d, want the 2 of the first batch only", n)
+	}
+	issues, err := ListIssues(context.Background(), env.pool, job.ID, "", "", 50, 0)
+	if err != nil || len(issues) != 1 {
+		t.Fatalf("issues = %+v, err %v; want exactly one", issues, err)
+	}
+	if iss := issues[0]; iss.Code != CodeInvalidBatch || iss.Severity != SeverityBlocking || !strings.Contains(iss.Message, "1001 products") {
+		t.Errorf("issue = %+v, want a BLOCKING INVALID_BATCH that names the 1001 products", iss)
+	}
+}
+
+// mgrLogBuffer collects structured log lines written by worker goroutines.
+type mgrLogBuffer struct {
+	mu  sync.Mutex
+	buf strings.Builder
+}
+
+func (b *mgrLogBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *mgrLogBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// The worker reads the finished job back only to log it, on a context detached from
+// shutdown. Without a deadline of its own a database that stops answering would keep the
+// worker alive for good, Shutdown would time out, and closing the pool would wait with it.
+func TestLogFinishedGivesUpWhenTheDatabaseStopsAnswering(t *testing.T) {
+	pool := testutil.DB(t)
+	testutil.Reset(t, pool)
+	logs := &mgrLogBuffer{}
+	m := NewManager(pool, testutil.NewFakeSupplier(), fastRetryConfig(), Hooks{}, slog.New(slog.NewJSONHandler(logs, nil)))
+
+	ctx := context.Background()
+	lock, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Rollback(ctx) // frees the table even when the test fails below
+	// Every read of sync_jobs from another connection now waits for this transaction.
+	if _, err := lock.Exec(ctx, `LOCK TABLE sync_jobs IN ACCESS EXCLUSIVE MODE`); err != nil {
+		t.Fatal(err)
+	}
+
+	returned := make(chan struct{})
+	go func() {
+		m.logFinished(ctx, "00000000-0000-4000-8000-000000000000", StatusCompleted)
+		close(returned)
+	}()
+	select {
+	case <-returned:
+	case <-time.After(settleTimeout + 2*time.Second):
+		t.Fatalf("logFinished still waiting %s after the database stopped answering: it has no deadline", settleTimeout+2*time.Second)
+	}
+	if out := logs.String(); !strings.Contains(out, `"msg":"job.finished_unreadable"`) {
+		t.Errorf("giving up was not logged:\n%s", out)
+	}
 }
