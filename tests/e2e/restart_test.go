@@ -86,7 +86,7 @@ func goTool() string {
 	if runtime.GOOS == "windows" {
 		name += ".exe"
 	}
-	if goroot := runtime.GOROOT(); goroot != "" {
+	if goroot := os.Getenv("GOROOT"); goroot != "" {
 		if path := filepath.Join(goroot, "bin", name); fileExists(path) {
 			return path
 		}

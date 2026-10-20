@@ -130,7 +130,7 @@ CREATE UNIQUE INDEX sync_issues_open_fp ON sync_issues (job_id, fingerprint) WHE
 CREATE INDEX sync_issues_job_status_idx ON sync_issues (job_id, status);
 
 -- DB backstop for "no false success": a job cannot become COMPLETED while a blocking issue is open.
--- Race-free because every issue write for a job holds that job's row lock (§6.4).
+-- Race-free because every issue write for a job holds that job's row lock.
 CREATE FUNCTION sync_jobs_completion_guard() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
   IF NEW.status = 'COMPLETED' AND EXISTS (

@@ -116,6 +116,9 @@ var (
 	// ErrSimulatedCrash is returned by test hooks: the worker abandons the job without
 	// touching its state, exactly like a process that died at that point.
 	ErrSimulatedCrash = errors.New("simulated crash")
+	// ErrShuttingDown refuses a start or resume once the service has begun stopping its
+	// workers, so no new worker is spawned on a context that is already cancelled.
+	ErrShuttingDown = errors.New("service is shutting down")
 )
 
 // Hooks are deterministic fault-injection points. The zero value disables them.
