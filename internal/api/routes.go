@@ -10,15 +10,18 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/DuongCM2004/resilient-catalog-sync/internal/syncjob"
 )
 
 // Deps is everything the handlers need. Build it with field names: endpoints added later
-// (the sync manager first) append fields here.
+// append fields here.
 type Deps struct {
 	Pool       *pgxpool.Pool
 	Log        *slog.Logger
-	SupplierID string // default supplier for starting syncs and looking up products
-	APIToken   string // when set, POST routes require "Authorization: Bearer <token>"
+	Manager    *syncjob.Manager // starts and resumes sync jobs; the job routes use it
+	SupplierID string           // default supplier for starting syncs and looking up products
+	APIToken   string           // when set, POST routes require "Authorization: Bearer <token>"
 }
 
 // NewRouter returns the full HTTP handler: every route wrapped in request logging.

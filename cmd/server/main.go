@@ -17,6 +17,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+
 	"github.com/DuongCM2004/resilient-catalog-sync/internal/api"
 	"github.com/DuongCM2004/resilient-catalog-sync/internal/storage"
 	"github.com/DuongCM2004/resilient-catalog-sync/internal/supplier"
@@ -41,7 +43,7 @@ type config struct {
 	Retry       syncjob.Config
 	// Fault switches exist for demos and tests; all are off by default.
 	Faults     supplier.FaultOptions
-	CrashPoint string
+	CrashPoint string // "before_commit:<batch_id>" or "after_commit:<batch_id>"
 }
 
 func main() {
@@ -99,10 +101,26 @@ func run(ctx context.Context, cfg config, log *slog.Logger) error {
 	}
 	log.Info("migrations.applied", "versions", applied)
 
+	crash, err := parseCrashPoint(cfg.CrashPoint)
+	if err != nil {
+		return err
+	}
+	mgr := syncjob.NewManager(pool, supplier.NewFixtureClient(cfg.FixturesDir, cfg.Faults), cfg.Retry,
+		crash.hooks(log, os.Exit), log)
+	// Registered after the pool's Close, so it runs first: workers stop before their pool goes.
+	defer stopManager(mgr, log)
+
+	// Jobs left PENDING/RUNNING by a previous process have no worker. They are marked
+	// INTERRUPTED before the listener opens so no request can see or resume a stale state.
+	if _, err := mgr.Reconcile(ctx); err != nil {
+		return fmt.Errorf("reconcile jobs: %w", err)
+	}
+
 	srv := &http.Server{
 		Handler: api.NewRouter(api.Deps{
 			Pool:       pool,
 			Log:        log,
+			Manager:    mgr,
 			SupplierID: cfg.SupplierID,
 			APIToken:   cfg.APIToken,
 		}),
@@ -122,7 +140,8 @@ func run(ctx context.Context, cfg config, log *slog.Logger) error {
 	case <-ctx.Done():
 	}
 
-	// Stop accepting, let in-flight requests finish, then (deferred) close the pool.
+	// Stop accepting and let in-flight requests finish; then (deferred) interrupt the
+	// workers so their jobs can be resumed, and only then close the pool.
 	log.Info("server.stopping")
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
@@ -166,6 +185,9 @@ func loadConfig(getenv func(string) string) (config, error) {
 	}
 	if cfg.DatabaseURL == "" {
 		fail("DATABASE_URL is required")
+	}
+	if _, err := parseCrashPoint(cfg.CrashPoint); err != nil {
+		fail("%v", err)
 	}
 
 	// Render (and similar platforms) inject PORT; an explicit HTTP_ADDR always wins.
@@ -229,4 +251,86 @@ func redactURL(raw string) string {
 		u.RawQuery = q.Encode()
 	}
 	return u.Redacted()
+}
+
+// stopManager interrupts every running job and waits for the workers, bounded by
+// shutdownTimeout. A job whose worker could not finish in time is left RUNNING with no
+// worker; the next start's reconcile (or a resume) deals with it.
+func stopManager(m *syncjob.Manager, log *slog.Logger) {
+	log.Info("workers.stopping")
+	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer cancel()
+	if err := m.Shutdown(ctx); err != nil {
+		log.Error("workers.stop_incomplete", "error", err)
+		return
+	}
+	log.Info("workers.stopped")
+}
+
+// crashPoint is a demo/test fault: end the process abruptly at one named batch, either just
+// before its transaction commits or just after, to show that a real crash loses nothing and
+// duplicates nothing. The zero value means no fault.
+type crashPoint struct {
+	when    string // crashBeforeCommit or crashAfterCommit
+	batchID string
+}
+
+const (
+	crashBeforeCommit = "before_commit"
+	crashAfterCommit  = "after_commit"
+)
+
+// exitCodeCrashPoint is the process exit status of an injected crash, distinct from the 1
+// of a configuration or startup failure.
+const exitCodeCrashPoint = 3
+
+// parseCrashPoint reads CRASH_POINT. An empty value is no fault; anything that is not
+// exactly "<when>:<batch_id>" is an error, so a typo cannot silently disable the fault a
+// demo depends on.
+func parseCrashPoint(raw string) (crashPoint, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return crashPoint{}, nil
+	}
+	when, batchID, ok := strings.Cut(raw, ":")
+	if !ok || batchID == "" || (when != crashBeforeCommit && when != crashAfterCommit) {
+		return crashPoint{}, fmt.Errorf("CRASH_POINT must be %s:<batch_id> or %s:<batch_id>, got %q",
+			crashBeforeCommit, crashAfterCommit, raw)
+	}
+	return crashPoint{when: when, batchID: batchID}, nil
+}
+
+func (c crashPoint) String() string {
+	if c.when == "" {
+		return ""
+	}
+	return c.when + ":" + c.batchID
+}
+
+// hooks returns the processor hooks that call exit(3) at the configured batch, after
+// logging fault.crash_point. exit is os.Exit in production. Should it return (tests), the
+// hook reports ErrSimulatedCrash so the worker abandons the job like a dead process would.
+func (c crashPoint) hooks(log *slog.Logger, exit func(int)) syncjob.Hooks {
+	crash := func(batchID string) error {
+		log.Error("fault.crash_point", "point", c.String(), "batch_id", batchID)
+		exit(exitCodeCrashPoint)
+		return syncjob.ErrSimulatedCrash
+	}
+	switch c.when {
+	case crashBeforeCommit:
+		return syncjob.Hooks{BeforeCommit: func(_ context.Context, _ pgx.Tx, batchID string) error {
+			if batchID == c.batchID {
+				return crash(batchID)
+			}
+			return nil
+		}}
+	case crashAfterCommit:
+		return syncjob.Hooks{AfterCommit: func(batchID string) error {
+			if batchID == c.batchID {
+				return crash(batchID)
+			}
+			return nil
+		}}
+	}
+	return syncjob.Hooks{}
 }

@@ -603,3 +603,110 @@ func TestResolveIssuesLeavesOtherJobsAlone(t *testing.T) {
 		t.Fatalf("second job open blocking = %d, want 0", n)
 	}
 }
+
+func TestSettleJobRecordsTheIssueAndMovesARunningJobTogether(t *testing.T) {
+	pool := storeTestPool(t)
+	ctx := context.Background()
+	id := storeSeedJob(t, pool, "UPDATE-1", StatusRunning)
+	if _, err := pool.Exec(ctx, `UPDATE sync_jobs SET next_cursor = 'cursor-003' WHERE id = $1::uuid`, id); err != nil {
+		t.Fatal(err)
+	}
+
+	// No cursor on the issue: it takes the job's own, so it can resolve when that batch commits.
+	iss := Issue{Code: CodeInvalidBatch, Severity: SeverityBlocking, Message: "no has_more marker"}
+	prev, applied, err := settleJob(ctx, pool, id, &iss, StatusNeedsAttention, "no has_more marker")
+	if err != nil || !applied || prev.Status != StatusRunning || prev.UpdateID != "UPDATE-1" {
+		t.Fatalf("settleJob = applied %v err %v, want applied", applied, err)
+	}
+
+	job, err := GetJob(ctx, pool, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if job.Status != StatusNeedsAttention || job.LastError == nil || *job.LastError != "no has_more marker" || job.OpenBlockingIssues != 1 {
+		t.Fatalf("job = status %s last_error %v open_blocking %d", job.Status, job.LastError, job.OpenBlockingIssues)
+	}
+	rows := storeIssueRows(t, pool, id)
+	if len(rows) != 1 || rows[0].Cursor != "cursor-003" || rows[0].Code != string(CodeInvalidBatch) || rows[0].Status != "OPEN" {
+		t.Fatalf("issues = %+v, want one OPEN INVALID_BATCH at cursor-003", rows)
+	}
+}
+
+func TestSettleJobWithoutIssueOnlyMovesTheJob(t *testing.T) {
+	pool := storeTestPool(t)
+	id := storeSeedJob(t, pool, "UPDATE-1", StatusRunning)
+
+	_, applied, err := settleJob(context.Background(), pool, id, nil, StatusInterrupted, "interrupted")
+	if err != nil || !applied {
+		t.Fatalf("settleJob = applied %v err %v, want applied", applied, err)
+	}
+	if n := storeCount(t, pool, `SELECT count(*) FROM sync_issues`); n != 0 {
+		t.Fatalf("issue rows = %d, want 0", n)
+	}
+	if job, _ := GetJob(context.Background(), pool, id); job.Status != StatusInterrupted {
+		t.Fatalf("status = %s, want INTERRUPTED", job.Status)
+	}
+}
+
+func TestSettleJobLeavesAJobThatIsNoLongerRunningAlone(t *testing.T) {
+	pool := storeTestPool(t)
+	ctx := context.Background()
+	for _, status := range []Status{StatusInterrupted, StatusNeedsAttention, StatusCompleted, StatusFailed} {
+		t.Run(string(status), func(t *testing.T) {
+			storeResetJobs(t, pool)
+			id := storeSeedJob(t, pool, "UPDATE-1", status)
+			iss := storeIssue(id, CodeInvalidBatch, SeverityBlocking, "")
+
+			prev, applied, err := settleJob(ctx, pool, id, &iss, StatusNeedsAttention, "late")
+			if err != nil || applied || prev.Status != status {
+				t.Fatalf("settleJob = prev %s applied %v err %v, want not applied", prev.Status, applied, err)
+			}
+			job, _ := GetJob(ctx, pool, id)
+			if job.Status != status || job.LastError != nil {
+				t.Fatalf("job = %s / %v, want untouched %s", job.Status, job.LastError, status)
+			}
+			if n := storeCount(t, pool, `SELECT count(*) FROM sync_issues`); n != 0 {
+				t.Fatalf("issue rows = %d, want none for a job that moved on", n)
+			}
+		})
+	}
+}
+
+func TestSettleJobOfUnknownJobIsNotFound(t *testing.T) {
+	pool := storeTestPool(t)
+	for _, id := range []string{"00000000-0000-0000-0000-000000000000", "not-a-uuid"} {
+		if _, _, err := settleJob(context.Background(), pool, id, nil, StatusInterrupted, "x"); !errors.Is(err, ErrNotFound) {
+			t.Errorf("settleJob(%q) error = %v, want ErrNotFound", id, err)
+		}
+	}
+}
+
+// storeResetJobs empties the job tables between subtests that reuse one update id.
+func storeResetJobs(t *testing.T, pool *pgxpool.Pool) {
+	t.Helper()
+	if _, err := pool.Exec(context.Background(), `TRUNCATE sync_issues, sync_changes, sync_batches, sync_jobs CASCADE`); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestResolveTransientIssuesClosesOnlyTransientOnes(t *testing.T) {
+	pool := storeTestPool(t)
+	job := storeMustCreate(t, pool, "UPDATE-1")
+	storeRecord(t, pool, storeIssue(job.ID, CodeSupplierUnavailable, SeverityTransient, "cursor-003"))
+	storeRecord(t, pool, storeIssue(job.ID, CodeInvalidBatch, SeverityBlocking, "cursor-003"))
+
+	storeInJobTx(t, pool, job.ID, func(ctx context.Context, tx pgx.Tx) error { return resolveTransientIssues(ctx, tx, job.ID) })
+
+	for _, row := range storeIssueRows(t, pool, job.ID) {
+		switch row.Severity {
+		case string(SeverityTransient):
+			if row.Status != "RESOLVED" || !row.Resolved {
+				t.Errorf("transient issue = %+v, want RESOLVED with resolved_at", row)
+			}
+		case string(SeverityBlocking):
+			if row.Status != "OPEN" {
+				t.Errorf("blocking issue = %+v, want it left OPEN even at the same cursor", row)
+			}
+		}
+	}
+}

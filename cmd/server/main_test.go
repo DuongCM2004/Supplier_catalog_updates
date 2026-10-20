@@ -2,15 +2,19 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/DuongCM2004/resilient-catalog-sync/internal/syncjob"
 	"github.com/DuongCM2004/resilient-catalog-sync/internal/testutil"
 )
 
@@ -184,5 +188,199 @@ func TestRunFailsWhenDatabaseNeverAnswers(t *testing.T) {
 	err := run(context.Background(), cfg, slog.New(slog.NewJSONHandler(io.Discard, nil)))
 	if err == nil || !strings.Contains(err.Error(), "not reachable") {
 		t.Fatalf("run err = %v, want a database-not-reachable error", err)
+	}
+}
+
+func TestLoadConfigRejectsMalformedCrashPoint(t *testing.T) {
+	base := map[string]string{"DATABASE_URL": "postgres://u:p@db/c"}
+	for _, bad := range []string{"before_commit", "before_commit:", ":BATCH-1", "during_commit:BATCH-1", "after-commit:BATCH-1", "BATCH-1"} {
+		vars := map[string]string{"CRASH_POINT": bad}
+		for k, v := range base {
+			vars[k] = v
+		}
+		if _, err := loadConfig(env(vars)); err == nil || !strings.Contains(err.Error(), "CRASH_POINT") {
+			t.Errorf("CRASH_POINT=%q: error = %v, want a CRASH_POINT error", bad, err)
+		}
+	}
+	for _, good := range []string{"", "before_commit:BATCH-003", "after_commit:BATCH-002", " after_commit:BATCH-002 "} {
+		vars := map[string]string{"CRASH_POINT": good}
+		for k, v := range base {
+			vars[k] = v
+		}
+		if _, err := loadConfig(env(vars)); err != nil {
+			t.Errorf("CRASH_POINT=%q rejected: %v", good, err)
+		}
+	}
+}
+
+func TestCrashPointHooksFireOnlyAtTheNamedPhaseAndBatch(t *testing.T) {
+	tests := []struct {
+		raw                   string
+		wantBefore, wantAfter bool
+	}{
+		{raw: "before_commit:BATCH-2", wantBefore: true},
+		{raw: "after_commit:BATCH-2", wantAfter: true},
+		{raw: ""},
+	}
+	for _, tc := range tests {
+		t.Run("CRASH_POINT="+tc.raw, func(t *testing.T) {
+			cp, err := parseCrashPoint(tc.raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var logs strings.Builder
+			var exits []int
+			hooks := cp.hooks(slog.New(slog.NewJSONHandler(&logs, nil)), func(code int) { exits = append(exits, code) })
+			if (hooks.BeforeCommit != nil) != tc.wantBefore || (hooks.AfterCommit != nil) != tc.wantAfter {
+				t.Fatalf("hooks set: before %v after %v, want before %v after %v", hooks.BeforeCommit != nil, hooks.AfterCommit != nil, tc.wantBefore, tc.wantAfter)
+			}
+
+			fire := func(batchID string) error {
+				switch {
+				case hooks.BeforeCommit != nil:
+					return hooks.BeforeCommit(context.Background(), nil, batchID)
+				case hooks.AfterCommit != nil:
+					return hooks.AfterCommit(batchID)
+				}
+				return nil
+			}
+			if err := fire("BATCH-1"); err != nil || len(exits) != 0 {
+				t.Fatalf("another batch: err %v, exits %v; want the process left alone", err, exits)
+			}
+			if tc.raw == "" {
+				return
+			}
+			if err := fire("BATCH-2"); !errors.Is(err, syncjob.ErrSimulatedCrash) || len(exits) != 1 || exits[0] != 3 {
+				t.Fatalf("named batch: err %v, exits %v; want exit status 3", err, exits)
+			}
+			if out := logs.String(); !strings.Contains(out, `"msg":"fault.crash_point"`) || !strings.Contains(out, tc.raw) {
+				t.Fatalf("crash was not logged before exiting: %q", out)
+			}
+		})
+	}
+}
+
+// lockedBuffer lets the server goroutine log while the test reads.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf strings.Builder
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// startServer runs the server against the test database and returns once its listener
+// answers (the moment startup is over), with the structured log captured so far and a
+// function that stops it gracefully and returns what run returned.
+func startServer(t *testing.T) (logs *lockedBuffer, stop func() error) {
+	t.Helper()
+	addr := freeAddr(t)
+	cfg := config{DatabaseURL: os.Getenv("TEST_DATABASE_URL"), DBWait: 5 * time.Second, HTTPAddr: addr, SupplierID: "SUP-001"}
+	logs = &lockedBuffer{}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	done := make(chan error, 1)
+	go func() { done <- run(ctx, cfg, slog.New(slog.NewJSONHandler(logs, nil))) }()
+
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		resp, err := http.Get("http://" + addr + "/healthz")
+		if err == nil {
+			resp.Body.Close()
+			break
+		}
+		select {
+		case runErr := <-done:
+			t.Fatalf("run ended before serving: %v", runErr)
+		case <-time.After(50 * time.Millisecond):
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("server never answered on %s: %v", addr, err)
+		}
+	}
+	return logs, func() error {
+		cancel()
+		select {
+		case err := <-done:
+			return err
+		case <-time.After(15 * time.Second):
+			return errors.New("run did not return after its context ended")
+		}
+	}
+}
+
+// logEvent returns the first structured log line with this message, decoded, or nil.
+func logEvent(t *testing.T, logs string, msg string) map[string]any {
+	t.Helper()
+	for _, line := range strings.Split(logs, "\n") {
+		var rec map[string]any
+		if json.Unmarshal([]byte(line), &rec) == nil && rec["msg"] == msg {
+			return rec
+		}
+	}
+	return nil
+}
+
+func TestRunInterruptsJobsLeftActiveBeforeItStartsServing(t *testing.T) {
+	pool := testutil.DB(t)
+	testutil.Reset(t, pool)
+	var jobID string
+	err := pool.QueryRow(context.Background(), `INSERT INTO sync_jobs (supplier_id, supplier_update_id, status)
+		VALUES ('SUP-001', 'UPDATE-1', 'RUNNING') RETURNING id::text`).Scan(&jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	logs, stop := startServer(t)
+
+	var status string
+	if err := pool.QueryRow(context.Background(), `SELECT status FROM sync_jobs WHERE id = $1::uuid`, jobID).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "INTERRUPTED" {
+		t.Fatalf("job status when the server started answering = %s, want INTERRUPTED: reconcile must finish before the listener opens", status)
+	}
+	out := logs.String()
+	reconciled, listening := strings.Index(out, `"msg":"startup.reconciled"`), strings.Index(out, `"msg":"server.listening"`)
+	if reconciled < 0 || listening < 0 || reconciled > listening {
+		t.Fatalf("startup.reconciled must be logged before server.listening:\n%s", out)
+	}
+	rec := logEvent(t, out, "startup.reconciled")
+	if rec["level"] != "WARN" || rec["count"] != float64(1) || len(rec["job_ids"].([]any)) != 1 || rec["job_ids"].([]any)[0] != jobID {
+		t.Fatalf("startup.reconciled = %v, want WARN, count 1, job_ids [%s]", rec, jobID)
+	}
+
+	if err := stop(); err != nil {
+		t.Fatalf("graceful stop returned %v, want nil", err)
+	}
+	if out := logs.String(); !strings.Contains(out, `"msg":"workers.stopped"`) {
+		t.Fatalf("workers were not stopped on shutdown:\n%s", out)
+	}
+}
+
+func TestRunLogsReconcileOnEveryStartEvenWhenNothingWasLeftActive(t *testing.T) {
+	pool := testutil.DB(t)
+	testutil.Reset(t, pool)
+
+	logs, stop := startServer(t)
+	rec := logEvent(t, logs.String(), "startup.reconciled")
+	if rec == nil {
+		t.Fatalf("startup.reconciled was not logged on a start with nothing to reconcile:\n%s", logs.String())
+	}
+	ids, isList := rec["job_ids"].([]any)
+	if rec["level"] != "INFO" || rec["count"] != float64(0) || !isList || len(ids) != 0 {
+		t.Fatalf("startup.reconciled = %v, want INFO, count 0, job_ids []", rec)
+	}
+	if err := stop(); err != nil {
+		t.Fatalf("graceful stop returned %v, want nil", err)
 	}
 }
