@@ -84,7 +84,7 @@ func errorStatus(err error) (status int, code, message string) {
 		return http.StatusConflict, "INVALID_STATE", "the job is not in a state that allows this operation"
 	case errors.Is(err, syncjob.ErrShuttingDown):
 		return http.StatusServiceUnavailable, "SHUTTING_DOWN", "the service is shutting down, retry after it has restarted"
-	case storage.IsConnectionError(err):
+	case storage.IsRetryable(err): // connection loss, but also 53300 too many connections, 57014 statement timeout
 		return http.StatusServiceUnavailable, "DB_UNAVAILABLE", "database unavailable, retry shortly"
 	}
 	return http.StatusInternalServerError, "INTERNAL", "internal error"

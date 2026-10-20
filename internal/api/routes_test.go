@@ -190,6 +190,9 @@ func TestErrorStatusMapsDomainAndDatabaseErrors(t *testing.T) {
 		{fmt.Errorf("start: %w", syncjob.ErrShuttingDown), 503, "SHUTTING_DOWN"},
 		{fmt.Errorf("query: %w", &pgconn.PgError{Code: "08006"}), 503, "DB_UNAVAILABLE"},
 		{fmt.Errorf("query: %w", context.DeadlineExceeded), 503, "DB_UNAVAILABLE"},
+		{fmt.Errorf("query: %w", &pgconn.PgError{Code: "53300"}), 503, "DB_UNAVAILABLE"},
+		{fmt.Errorf("query: %w", &pgconn.PgError{Code: "57014"}), 503, "DB_UNAVAILABLE"},
+		{fmt.Errorf("query: %w", &pgconn.PgError{Code: "40001"}), 503, "DB_UNAVAILABLE"},
 		{errors.New("boom: password=hunter2"), 500, "INTERNAL"},
 		{fmt.Errorf("insert: %w", &pgconn.PgError{Code: "23514"}), 500, "INTERNAL"},
 	}
