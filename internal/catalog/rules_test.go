@@ -57,6 +57,9 @@ func TestValidateBatchAcceptsValidRecords(t *testing.T) {
 		{"withdrawal details are ignored", []SupplierProduct{with(withdrawnEvent("SKU-9", 4), func(e *SupplierProduct) {
 			e.Name, e.PriceMinor, e.Currency = ptr("  "), ptr(int64(-5)), ptr("nope")
 		})}},
+		{"withdrawal details PostgreSQL could not store are ignored too", []SupplierProduct{with(withdrawnEvent("SKU-9", 4), func(e *SupplierProduct) {
+			e.Name, e.Currency = ptr("Wid\x00get"), ptr("\xff")
+		})}},
 		{"longest allowed product id and name", []SupplierProduct{with(activeEvent(strings.Repeat("p", maxProductIDLen), 1), func(e *SupplierProduct) {
 			e.Name = ptr(strings.Repeat("n", maxNameLen))
 		})}},

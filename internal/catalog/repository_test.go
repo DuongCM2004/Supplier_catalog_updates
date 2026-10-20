@@ -177,6 +177,23 @@ func TestWithdrawingAnUnseenProductStoresATombstoneWithoutDetails(t *testing.T) 
 	}
 }
 
+// The details a withdrawal carries are dropped before the database sees them, so even text
+// PostgreSQL cannot store (a NUL byte) does not fail the batch.
+func TestWithdrawalDetailsNeverReachTheDatabase(t *testing.T) {
+	pool := newPool(t)
+	w := withdrawn("GHOST", 4)
+	w.Name, w.Currency = ptr("Wid\x00get"), ptr("\xff")
+
+	if err := catalog.ValidateBatch([]catalog.SupplierProduct{w}, supplier); err != nil {
+		t.Fatalf("ValidateBatch: %v", err)
+	}
+	mustApply(t, pool, w)
+
+	if p := row(t, pool, "GHOST"); p.Name != nil || p.Currency != nil {
+		t.Fatalf("tombstone kept withdrawal details: %+v", p)
+	}
+}
+
 func TestOutOfOrderRevisionsInOneBatchEndAtTheHighest(t *testing.T) {
 	pool := newPool(t)
 
