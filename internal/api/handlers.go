@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"cmp"
 	"context"
 	"encoding/json"
@@ -41,15 +42,22 @@ var idPattern = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
 // writeJSON encodes before writing, so a value that cannot be encoded produces a clean 500
 // instead of a truncated 200.
 func writeJSON(w http.ResponseWriter, status int, v any) {
-	body, err := json.Marshal(v)
-	if err != nil {
+	var body bytes.Buffer
+	enc := json.NewEncoder(&body)
+	// Messages quote supplier data such as "price_minor must be >= 0"; Go's default HTML
+	// escaping would print that as >= to every curl user. The body is never served as
+	// HTML, and nosniff below stops browsers from guessing otherwise.
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil {
 		status = http.StatusInternalServerError
-		body = []byte(`{"error":{"code":"INTERNAL","message":"internal error"}}`)
+		body.Reset()
+		body.WriteString(`{"error":{"code":"INTERNAL","message":"internal error"}}` + "\n")
 	}
 	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.WriteHeader(status)
 	// A failed write means the client went away; there is nobody left to tell.
-	_, _ = w.Write(append(body, '\n'))
+	_, _ = w.Write(body.Bytes())
 }
 
 // writeError sends the error envelope {"error":{"code","message",...extra}}. Extra fields

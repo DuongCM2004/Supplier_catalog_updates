@@ -1094,3 +1094,31 @@ func TestEveryEndpointAnswers503WithoutLeakingDetailsWhileTheDatabaseIsDown(t *t
 		})
 	}
 }
+
+func TestWriteJSONKeepsComparisonSignsReadableAndRefusesToSniff(t *testing.T) {
+	rec := httptest.NewRecorder()
+	writeJSON(rec, http.StatusUnprocessableEntity, map[string]string{"message": "price_minor must be >= 0 & <name> set"})
+
+	if !strings.Contains(rec.Body.String(), "price_minor must be >= 0 & <name> set") {
+		t.Errorf("body = %q, want the text unescaped", rec.Body.String())
+	}
+	if got := routesDecodeBody(t, rec)["message"]; got != "price_minor must be >= 0 & <name> set" {
+		t.Errorf("decoded message = %v", got)
+	}
+	if rec.Code != http.StatusUnprocessableEntity || rec.Header().Get("X-Content-Type-Options") != "nosniff" {
+		t.Errorf("status %d, nosniff %q", rec.Code, rec.Header().Get("X-Content-Type-Options"))
+	}
+}
+
+func TestWriteJSONAnswers500WhenTheValueCannotBeEncoded(t *testing.T) {
+	rec := httptest.NewRecorder()
+	writeJSON(rec, http.StatusOK, map[string]any{"bad": make(chan int)})
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500 and not a truncated 200", rec.Code)
+	}
+	errBody, _ := routesDecodeBody(t, rec)["error"].(map[string]any)
+	if errBody["code"] != "INTERNAL" {
+		t.Errorf("error body = %v", errBody)
+	}
+}
