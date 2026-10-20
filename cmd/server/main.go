@@ -27,7 +27,12 @@ import (
 )
 
 const (
+	// The request limits stop a slow or silent client from pinning a goroutine and a
+	// connection. There is no WriteTimeout: responses are small, and a write that stalls
+	// ends with the client's connection.
 	readHeaderTimeout = 5 * time.Second
+	readTimeout       = 15 * time.Second // whole request, body included (bodies are at most 1 MiB)
+	idleTimeout       = 60 * time.Second // keep-alive connection waiting for its next request
 	// shutdownTimeout is the one deadline for stopping the HTTP server and the sync workers
 	// together. It is shorter than Docker's default 10 s stop grace so that closing the
 	// database pool and exiting still finish before SIGKILL.
@@ -124,16 +129,13 @@ func run(ctx context.Context, cfg config, log *slog.Logger) error {
 		return fmt.Errorf("reconcile jobs: %w", err)
 	}
 
-	srv := &http.Server{
-		Handler: api.NewRouter(api.Deps{
-			Pool:       pool,
-			Log:        log,
-			Manager:    mgr,
-			SupplierID: cfg.SupplierID,
-			APIToken:   cfg.APIToken,
-		}),
-		ReadHeaderTimeout: readHeaderTimeout,
-	}
+	srv := newHTTPServer(api.NewRouter(api.Deps{
+		Pool:       pool,
+		Log:        log,
+		Manager:    mgr,
+		SupplierID: cfg.SupplierID,
+		APIToken:   cfg.APIToken,
+	}))
 	ln, err := net.Listen("tcp", cfg.HTTPAddr)
 	if err != nil {
 		return fmt.Errorf("listen on %s: %w", cfg.HTTPAddr, err)
@@ -152,6 +154,16 @@ func run(ctx context.Context, cfg config, log *slog.Logger) error {
 	}
 	log.Info("server.stopping")
 	return stopServing(srv, mgr, log)
+}
+
+// newHTTPServer is the server with the request and keep-alive limits above.
+func newHTTPServer(h http.Handler) *http.Server {
+	return &http.Server{
+		Handler:           h,
+		ReadHeaderTimeout: readHeaderTimeout,
+		ReadTimeout:       readTimeout,
+		IdleTimeout:       idleTimeout,
+	}
 }
 
 // stopServing stops the HTTP server and the sync workers at the same time, both bounded by

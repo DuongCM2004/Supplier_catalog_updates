@@ -503,3 +503,16 @@ func TestRunStopsWorkersAtOnceWhileAnIdleConnectionDelaysTheHTTPShutdown(t *test
 		t.Errorf("want workers.stopped logged before server.stopped (the idle connection holds the HTTP shutdown back):\n%s", out)
 	}
 }
+
+// Without a ReadTimeout a client that sends part of a body and then goes quiet, and without
+// an IdleTimeout a keep-alive client that never sends another request, hold a goroutine and
+// a connection for as long as they like.
+func TestHTTPServerBoundsSlowAndIdleClients(t *testing.T) {
+	srv := newHTTPServer(http.NotFoundHandler())
+	if srv.ReadHeaderTimeout != 5*time.Second || srv.ReadTimeout != 15*time.Second || srv.IdleTimeout != 60*time.Second {
+		t.Errorf("read header %s, read %s, idle %s; want 5s, 15s and 60s", srv.ReadHeaderTimeout, srv.ReadTimeout, srv.IdleTimeout)
+	}
+	if srv.ReadTimeout < srv.ReadHeaderTimeout {
+		t.Errorf("ReadTimeout %s is shorter than ReadHeaderTimeout %s, which it includes", srv.ReadTimeout, srv.ReadHeaderTimeout)
+	}
+}
