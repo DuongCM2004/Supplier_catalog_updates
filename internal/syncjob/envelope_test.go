@@ -45,6 +45,11 @@ func TestValidateEnvelopeRules(t *testing.T) {
 		{"has_more without next cursor", func(b *supplier.Batch) { b.NextCursor = "" }, CodeInvalidCursor},
 		{"next cursor equal to the cursor just fetched", func(b *supplier.Batch) { b.NextCursor = requested }, CodeInvalidCursor},
 		{"end of feed that still names a next cursor", func(b *supplier.Batch) { b.HasMore = envFalse() }, CodeInvalidCursor},
+		{"NUL byte in update id", func(b *supplier.Batch) { b.UpdateID = "UPDATE-1\x00" }, CodeInvalidBatch},
+		{"NUL byte in batch id", func(b *supplier.Batch) { b.BatchID = "BATCH\x002" }, CodeInvalidBatch},
+		{"invalid UTF-8 in batch id", func(b *supplier.Batch) { b.BatchID = "BATCH-\xff2" }, CodeInvalidBatch},
+		{"NUL byte in next cursor", func(b *supplier.Batch) { b.NextCursor = "cursor\x00003" }, CodeInvalidBatch},
+		{"invalid UTF-8 in next cursor", func(b *supplier.Batch) { b.NextCursor = "cursor-\xc3" }, CodeInvalidBatch},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -62,6 +67,9 @@ func TestValidateEnvelopeRules(t *testing.T) {
 			}
 			if got.Code != tc.wantCode || got.Severity != SeverityBlocking || got.Message == "" {
 				t.Fatalf("validateEnvelope = %+v, want blocking %s with a message", *got, tc.wantCode)
+			}
+			if !cleanText(got.Message) {
+				t.Fatalf("message %q cannot be stored in PostgreSQL, so the issue about this batch could not be recorded", got.Message)
 			}
 		})
 	}

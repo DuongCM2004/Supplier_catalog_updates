@@ -705,3 +705,39 @@ func TestImplausibleAnnouncedBatchCountBlocksTheJobAsInvalid(t *testing.T) {
 		})
 	}
 }
+
+// A batch id PostgreSQL cannot store used to end as a DATABASE_ERROR about an INSERT that
+// could not even record its own issue. It is the supplier's malformed batch.
+func TestBatchWithUnstorableTextBlocksTheJobAsInvalidBatch(t *testing.T) {
+	tests := []struct {
+		name        string
+		mutate      func(b *supplier.Batch)
+		wantBatchID bool // the issue names the batch only when its id could be stored
+	}{
+		{"NUL byte in batch id", func(b *supplier.Batch) { b.BatchID = "BATCH\x002" }, false},
+		{"invalid UTF-8 in batch id", func(b *supplier.Batch) { b.BatchID = "BATCH-\xff2" }, false},
+		{"NUL byte in next cursor", func(b *supplier.Batch) { b.NextCursor = "cursor\x003" }, true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			env := mgrSetup(t, Hooks{})
+			page := testutil.Page(mgrUpdate, "BATCH-2", "cursor-3", true, testutil.Active("SKU-9", 1, "Widget", 1000))
+			tc.mutate(&page)
+			env.sup.AddPage("cursor-2", page)
+			job := mgrStart(t, env.m, mgrUpdate)
+			env.m.Wait()
+
+			after := mgrJob(t, env.pool, job.ID)
+			if after.Status != StatusNeedsAttention || after.ProcessedBatches != 1 || after.NextCursor != "cursor-2" {
+				t.Fatalf("job = %s, %d batches, next %q; want NEEDS_ATTENTION after 1 batch at cursor-2", after.Status, after.ProcessedBatches, after.NextCursor)
+			}
+			issues, err := ListIssues(context.Background(), env.pool, job.ID, "", "", 50, 0)
+			if err != nil || len(issues) != 1 {
+				t.Fatalf("issues = %+v, err %v; want exactly one", issues, err)
+			}
+			if iss := issues[0]; iss.Code != CodeInvalidBatch || iss.Severity != SeverityBlocking || (iss.BatchID != nil) != tc.wantBatchID {
+				t.Errorf("issue = %+v, want a BLOCKING INVALID_BATCH (batch id recorded: %v)", iss, tc.wantBatchID)
+			}
+		})
+	}
+}

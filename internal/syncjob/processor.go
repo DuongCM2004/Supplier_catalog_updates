@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -60,15 +61,24 @@ func blockErr(code IssueCode, format string, args ...any) error {
 //
 // A batch that points back at the cursor it was fetched with would be fetched again
 // forever, so that is rejected here rather than discovered by looping.
+//
+// Text that PostgreSQL cannot store (a NUL byte, invalid UTF-8) is rejected too, as
+// INVALID_BATCH, before it reaches a query: stored later it would fail with a database error
+// that reads like an outage and could not even be written into the issue about it. Messages
+// quote such values with %q, which escapes them, so they stay storable.
 func validateEnvelope(job Job, requestedCursor string, b supplier.Batch) *Issue {
 	invalid := func(code IssueCode, format string, args ...any) *Issue {
 		return &Issue{Code: code, Severity: SeverityBlocking, Message: fmt.Sprintf(format, args...)}
 	}
 	switch {
-	case b.UpdateID != job.UpdateID:
+	case b.UpdateID != job.UpdateID: // the job's id is stored text, so an unclean one is never equal to it
 		return invalid(CodeInvalidBatch, "batch belongs to update %.80q, but this job syncs %q", b.UpdateID, job.UpdateID)
 	case b.BatchID == "":
 		return invalid(CodeInvalidBatch, "batch has no batch_id")
+	case !cleanText(b.BatchID):
+		return invalid(CodeInvalidBatch, "batch_id %.80q is not valid text: it has a NUL byte or invalid UTF-8", b.BatchID)
+	case !cleanText(b.NextCursor):
+		return invalid(CodeInvalidBatch, "batch %.80q has a next_cursor that is not valid text: it has a NUL byte or invalid UTF-8 (%.80q)", b.BatchID, b.NextCursor)
 	case b.HasMore == nil:
 		return invalid(CodeInvalidBatch, "batch %.80q has no has_more marker, so the end of the feed cannot be told", b.BatchID)
 	case *b.HasMore && b.NextCursor == "":
@@ -79,6 +89,11 @@ func validateEnvelope(job Job, requestedCursor string, b supplier.Batch) *Issue 
 		return invalid(CodeInvalidCursor, "batch %.80q ends the feed but still gives next_cursor %.80q", b.BatchID, b.NextCursor)
 	}
 	return nil
+}
+
+// cleanText reports whether s can be stored in a PostgreSQL text column.
+func cleanText(s string) bool {
+	return utf8.ValidString(s) && !strings.ContainsRune(s, 0)
 }
 
 // hashedBatch fixes the field order of the hashed JSON, which is what makes BatchHash
@@ -174,7 +189,9 @@ func (p *Processor) ProcessBatch(ctx context.Context, jobID, requestedCursor str
 // worker got there first) nothing is recorded and the outcome is stale.
 func (p *Processor) block(ctx context.Context, log *slog.Logger, jobID, cursor, batchID string, iss Issue) (Outcome, error) {
 	iss.Cursor = &cursor
-	iss.BatchID = nonEmpty(batchID)
+	if cleanText(batchID) { // an unstorable id would make recording this very issue fail
+		iss.BatchID = nonEmpty(batchID)
+	}
 	_, applied, err := settleJob(ctx, p.pool, jobID, &iss, StatusNeedsAttention, iss.Message)
 	if err != nil {
 		return Outcome{}, fmt.Errorf("record %s issue: %w", iss.Code, err)
