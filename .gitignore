@@ -1,0 +1,11 @@
+# Build output
+/bin/
+/server
+*.exe
+
+# Local configuration (copy from .env.example)
+.env
+
+# Planning material kept out of the public repository
+Brainstorm/
+plans/
