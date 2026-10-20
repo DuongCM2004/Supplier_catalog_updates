@@ -32,9 +32,10 @@ func rowToProduct(row pgx.CollectableRow) (Product, error) { return scanProduct(
 // returns what happened to each event, in the order it was applied.
 //
 // Events are applied in (supplier, product, revision) order, so the outcome does not depend
-// on how the supplier ordered them. The affected rows are locked first, in that same key
-// order, so concurrent writers cannot deadlock and every decision is made on a row nobody
-// else can change. A conflicting event aborts the whole batch with a *BlockingError and
+// on how the supplier ordered them. The affected rows are locked first, in one statement
+// that orders them by key in the database's own collation, so every writer takes the locks in
+// the same order and cannot deadlock, and every decision is made on a row nobody else can
+// change. A conflicting event aborts the whole batch with a *BlockingError and
 // leaves the transaction open: the caller rolls it back, which discards the writes already
 // made for earlier events of this batch.
 func ApplyBatch(ctx context.Context, tx pgx.Tx, events []SupplierProduct) ([]Applied, error) {
