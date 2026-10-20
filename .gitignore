@@ -3,6 +3,9 @@
 /server
 *.exe
 
+# Project-local Go toolchain, module and build caches (see .tools/activate.sh)
+.tools/
+
 # Local configuration (copy from .env.example)
 .env
 
