@@ -34,9 +34,10 @@ type Manager struct {
 	baseCtx context.Context
 	cancel  context.CancelFunc
 
-	mu   sync.Mutex
-	live map[string]chan struct{} // jobs with a worker in this process; closed when that worker has fully finished
-	wg   sync.WaitGroup
+	mu      sync.Mutex
+	closing bool                     // set by Shutdown under mu; Start and Resume refuse from then on, so wg only shrinks
+	live    map[string]chan struct{} // jobs with a worker in this process; closed when that worker has fully finished
+	wg      sync.WaitGroup
 
 	cleanupBackoff time.Duration // first wait between attempts to un-strand a job; doubles up to cleanupMaxBackoff
 }
@@ -65,12 +66,16 @@ func NewManager(pool *pgxpool.Pool, sup supplier.Client, cfg Config, hooks Hooks
 // created is true. An update that already has a job returns that job with created=false and
 // is not touched, whatever state it is in: resuming is always an explicit Resume. Starting
 // a different update while another job is PENDING/RUNNING returns ErrActiveJobExists together
-// with the active job (zero Job if it just ended).
+// with the active job (zero Job if it just ended). Once Shutdown has begun it returns
+// ErrShuttingDown and creates nothing.
 func (m *Manager) Start(ctx context.Context, supplierID, updateID string) (Job, bool, error) {
 	// The lock covers insert and spawn, so a Resume of the new job cannot slip in between
 	// and mistake it for an orphan that has no worker yet.
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.closing {
+		return Job{}, false, ErrShuttingDown
+	}
 	job, created, err := createJob(ctx, m.pool, supplierID, updateID)
 	if err != nil || !created {
 		return job, false, err
@@ -85,14 +90,22 @@ func (m *Manager) Start(ctx context.Context, supplierID, updateID string) (Job, 
 // worker could not record how it ended, for example while the database was down) and is
 // adopted the same way, so no application restart is needed. A job whose worker is alive,
 // or that is COMPLETED/FAILED, returns ErrInvalidTransition; another active job returns
-// ErrActiveJobExists; an unknown id returns ErrNotFound.
+// ErrActiveJobExists; an unknown id returns ErrNotFound. Once Shutdown has begun it returns
+// ErrShuttingDown and changes nothing.
 func (m *Manager) Resume(ctx context.Context, jobID string) (Job, error) {
 	// Held from the live-set check to spawn, so concurrent resumes of one orphan start
 	// exactly one worker.
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.closing {
+		return Job{}, ErrShuttingDown
+	}
 	if err := m.awaitWorkerExit(ctx, jobID); err != nil {
 		return Job{}, err
+	}
+	// awaitWorkerExit lets go of the lock while it waits, so Shutdown may have begun meanwhile.
+	if m.closing {
+		return Job{}, ErrShuttingDown
 	}
 	prev, err := GetJob(ctx, m.pool, jobID)
 	if err != nil {
@@ -177,7 +190,26 @@ func (m *Manager) Wait() { m.wg.Wait() }
 
 // Shutdown tells every worker to stop and waits for them, up to ctx. A stopping worker
 // records its job as INTERRUPTED without an issue, so the job can simply be resumed.
+//
+// From the moment it takes the lock, Start and Resume answer ErrShuttingDown. Taking the
+// lock also waits for a Start or Resume that is already past its check, so a worker is never
+// added to the wait group while Shutdown is waiting on it, and none starts on a context that
+// is about to be cancelled. A Start stuck on a hung database holds the lock, so the wait for
+// it is bounded by ctx too; the workers are told to stop either way.
 func (m *Manager) Shutdown(ctx context.Context) error {
+	sealed := make(chan struct{})
+	go func() {
+		m.mu.Lock()
+		m.closing = true
+		m.mu.Unlock()
+		close(sealed)
+	}()
+	select {
+	case <-sealed:
+	case <-ctx.Done():
+		m.cancel()
+		return fmt.Errorf("shutdown: a start or resume is still in progress: %w", ctx.Err())
+	}
 	m.cancel()
 	finished := make(chan struct{})
 	go func() {

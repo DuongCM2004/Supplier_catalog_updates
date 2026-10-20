@@ -552,3 +552,79 @@ func TestResumeReturnsTheRunningSnapshotEvenWhenTheWorkerFinishesFirst(t *testin
 		}
 	})
 }
+
+// A request that is being handled when the service starts to stop must not add a worker
+// after Shutdown began waiting for them, nor start one on a context that is already
+// cancelled.
+func TestStartAndResumeAreRefusedOnceShutdownBegan(t *testing.T) {
+	env := mgrSetup(t, Hooks{})
+	env.sup.SetUpdate(testutil.Info("UPDATE-2", 1))
+	env.sup.Block("")
+	started := mgrStart(t, env.m, mgrUpdate)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := env.m.Shutdown(ctx); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+	if job := mgrJob(t, env.pool, started.ID); job.Status != StatusInterrupted {
+		t.Fatalf("job after Shutdown = %s, want INTERRUPTED", job.Status)
+	}
+
+	if job, created, err := env.m.Start(ctx, testutil.SupplierID, "UPDATE-2"); !errors.Is(err, ErrShuttingDown) || created || job.ID != "" {
+		t.Errorf("Start after Shutdown = job %q, created %v, err %v; want ErrShuttingDown and nothing created", job.ID, created, err)
+	}
+	if _, err := env.m.Resume(ctx, started.ID); !errors.Is(err, ErrShuttingDown) {
+		t.Errorf("Resume after Shutdown: error = %v, want ErrShuttingDown", err)
+	}
+	if n := storeCount(t, env.pool, `SELECT count(*) FROM sync_jobs`); n != 1 {
+		t.Errorf("sync_jobs rows = %d, want 1: a refused start must not leave a job behind", n)
+	}
+	if job := mgrJob(t, env.pool, started.ID); job.Status != StatusInterrupted {
+		t.Errorf("job after the refused Resume = %s, want it left INTERRUPTED", job.Status)
+	}
+	env.m.Wait() // returns at once: no worker was added after Shutdown
+}
+
+// Shutdown waits for a Start or Resume that is already past its check, which can be stuck on
+// a hung database. That wait must not outlive the caller's deadline, and the workers must
+// still be told to stop.
+func TestShutdownGivesUpWaitingForAStuckStartAtItsDeadline(t *testing.T) {
+	env := mgrSetup(t, Hooks{})
+	env.m.mu.Lock() // what Start holds while its INSERT hangs
+	released := false
+	release := func() {
+		if !released {
+			released = true
+			env.m.mu.Unlock()
+		}
+	}
+	defer release()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	began := time.Now()
+	err := env.m.Shutdown(ctx)
+	if !errors.Is(err, context.DeadlineExceeded) || time.Since(began) > 2*time.Second {
+		t.Fatalf("Shutdown = %v after %s, want the context deadline error at about 100ms", err, time.Since(began))
+	}
+	if env.m.baseCtx.Err() == nil {
+		t.Error("workers were not told to stop although Shutdown gave up waiting")
+	}
+
+	// The sealing goroutine of the Shutdown that gave up completes once the lock is free.
+	release()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		env.m.mu.Lock()
+		closing := env.m.closing
+		env.m.mu.Unlock()
+		if closing {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("Start and Resume were still accepted 5s after the lock was released")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
