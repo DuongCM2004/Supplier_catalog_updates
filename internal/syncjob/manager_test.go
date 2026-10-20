@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/DuongCM2004/resilient-catalog-sync/internal/supplier"
@@ -626,5 +627,51 @@ func TestShutdownGivesUpWaitingForAStuckStartAtItsDeadline(t *testing.T) {
 			t.Fatal("Start and Resume were still accepted 5s after the lock was released")
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// Only a failure that a later attempt can get past may leave the job INTERRUPTED. One that
+// fails the same way on every resume must park the job for attention, or the operator is
+// told to resume forever.
+func TestOnlyARetryableDatabaseErrorInterruptsTheJob(t *testing.T) {
+	pg := func(code string) error { return &pgconn.PgError{Code: code, Message: "injected"} }
+	tests := []struct {
+		name         string
+		err          error
+		wantStatus   Status
+		wantSeverity Severity
+	}{
+		{"client-side encoding failure", errors.New("unable to encode 3000000000 into binary format for int4 (OID 23)"), StatusNeedsAttention, SeverityBlocking},
+		{"internal error", pg("XX000"), StatusNeedsAttention, SeverityBlocking},
+		{"undefined column", pg("42703"), StatusNeedsAttention, SeverityBlocking},
+		{"data exception", pg("22003"), StatusNeedsAttention, SeverityBlocking},
+		{"serialization failure", pg("40001"), StatusInterrupted, SeverityTransient},
+		{"too many connections", pg("53300"), StatusInterrupted, SeverityTransient},
+		{"statement timeout", pg("57014"), StatusInterrupted, SeverityTransient},
+		{"connection exception", pg("08006"), StatusInterrupted, SeverityTransient},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			env := mgrSetup(t, Hooks{BeforeCommit: func(_ context.Context, _ pgx.Tx, batchID string) error {
+				if batchID == "BATCH-2" {
+					return tc.err
+				}
+				return nil
+			}})
+			job := mgrStart(t, env.m, mgrUpdate)
+			env.m.Wait()
+
+			after := mgrJob(t, env.pool, job.ID)
+			if after.Status != tc.wantStatus || after.ProcessedBatches != 1 || after.NextCursor != "cursor-2" {
+				t.Fatalf("job = %s, %d batches, next %q; want %s after 1 batch at cursor-2", after.Status, after.ProcessedBatches, after.NextCursor, tc.wantStatus)
+			}
+			issues, err := ListIssues(context.Background(), env.pool, job.ID, "", "", 50, 0)
+			if err != nil || len(issues) != 1 {
+				t.Fatalf("issues = %+v, err %v; want exactly one", issues, err)
+			}
+			if iss := issues[0]; iss.Code != CodeDatabaseError || iss.Severity != tc.wantSeverity || iss.Cursor == nil || *iss.Cursor != "cursor-2" {
+				t.Errorf("issue = %+v, want a %s %s at cursor-2", iss, tc.wantSeverity, CodeDatabaseError)
+			}
+		})
 	}
 }

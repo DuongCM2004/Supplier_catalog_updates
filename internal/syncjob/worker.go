@@ -291,17 +291,19 @@ func (m *Manager) fail(ctx context.Context, jobID string, code IssueCode, cursor
 	return m.settle(ctx, jobID, &iss, StatusFailed, message)
 }
 
-// dbFailure handles a database error the run cannot continue from. A connection-class
-// error is transient: the job is interrupted and can be resumed. A data error (a constraint
-// or trigger refusal) would fail the same way every time, so it blocks the job instead.
-// A nil cursor means "wherever the job is now".
+// dbFailure handles a database error the run cannot continue from. Only an error that a
+// later attempt can get past (storage.IsRetryable: the connection, load or timing) is
+// transient: the job is interrupted and can be resumed. Anything else (a constraint or
+// trigger refusal, a client-side encoding failure, a bug) would fail the same way on every
+// resume, so it blocks the job for attention instead of inviting a resume loop. A nil
+// cursor means "wherever the job is now".
 func (m *Manager) dbFailure(ctx context.Context, jobID string, cursor *string, cause error) error {
 	if ctx.Err() != nil {
 		return m.interrupt(ctx, jobID, nil)
 	}
 	iss := Issue{Code: CodeDatabaseError, Severity: SeverityTransient, Cursor: cursor, Message: "database error: " + cause.Error()}
 	to := StatusInterrupted
-	if storage.IsDataError(cause) {
+	if !storage.IsRetryable(cause) {
 		iss.Severity, to = SeverityBlocking, StatusNeedsAttention
 	}
 	if err := m.settle(ctx, jobID, &iss, to, iss.Message); err != nil {

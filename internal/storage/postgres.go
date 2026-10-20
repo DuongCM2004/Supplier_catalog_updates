@@ -79,6 +79,29 @@ func IsConnectionError(err error) bool {
 		strings.Contains(err.Error(), "conn closed") || strings.Contains(err.Error(), "closed pool")
 }
 
+// IsRetryable reports failures where running the same work again later can succeed: every
+// connection error, plus the SQLSTATE classes whose cause is load or timing rather than the
+// statement: 40 (the transaction was rolled back: serialization failure, deadlock), 53
+// (insufficient resources: too many connections, out of memory or disk) and 57 (operator
+// intervention, including 57014 when a statement timeout cancels the query). Anything else,
+// whether a data error, a bug or a client-side encoding failure, would fail the same way
+// every time.
+func IsRetryable(err error) bool {
+	if IsConnectionError(err) {
+		return true
+	}
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		return false
+	}
+	for _, class := range []string{"40", "53", "57"} {
+		if strings.HasPrefix(pgErr.Code, class) {
+			return true
+		}
+	}
+	return false
+}
+
 // IsDataError reports SQLSTATE class 22 (data exception) or 23 (integrity constraint):
 // the statement itself is wrong, so retrying the same batch can never succeed.
 func IsDataError(err error) bool {
