@@ -61,6 +61,13 @@ func main() {
 
 	// A stop signal during the (possibly long) wait for PostgreSQL ends that wait too.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	// After the first signal the handler is released, so a second SIGINT or SIGTERM during
+	// the (up to shutdownTimeout long) graceful stop ends the process at once instead of
+	// being swallowed. Without this stop() would only run once run has returned.
+	go func() {
+		<-ctx.Done()
+		stop()
+	}()
 	err = run(ctx, cfg, log)
 	stop()
 	if err != nil {
