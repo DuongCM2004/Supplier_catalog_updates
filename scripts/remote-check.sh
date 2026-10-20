@@ -45,10 +45,16 @@ if [ -n "$API_TOKEN" ]; then
     https://* | http://localhost[:/]* | http://localhost | http://127.0.0.1[:/]* | http://127.0.0.1) ;;
     *) fail "setup: refusing to send API_TOKEN over plain http to $BASE; use https" ;;
   esac
+  # The token is written into a curl config line below, where these characters would need escaping.
+  case "$API_TOKEN" in
+    *[\"\\]* | *$'\n'* | *$'\r'*) fail "setup: API_TOKEN contains a quote, backslash or line break, which this script does not support" ;;
+  esac
 fi
 
 # req METHOD PATH [JSON_BODY]: sets CODE, and writes the response to $BODY_F / $HDR_F.
-# The bearer token goes on POST requests only, and only when API_TOKEN is set.
+# The bearer token goes on POST requests only, and only when API_TOKEN is set. It reaches
+# curl as a config line on stdin (printf is a shell builtin), never as an argument, so it
+# stays out of the process list while the request is in flight.
 req() {
   local method=$1 path=$2 data=${3:-}
   set -- -s --max-time 20 -D "$HDR_F" -o "$BODY_F" -w '%{http_code}' -X "$method"
@@ -56,9 +62,11 @@ req() {
     set -- "$@" -H 'Content-Type: application/json' -d "$data"
   fi
   if [ "$method" = POST ] && [ "$SEND_AUTH" = 1 ] && [ -n "$API_TOKEN" ]; then
-    set -- "$@" -H "Authorization: Bearer $API_TOKEN"
+    CODE=$(printf 'header = "Authorization: Bearer %s"\n' "$API_TOKEN" | curl -K - "$@" "$BASE$path") ||
+      fail "$method $path: curl could not complete the request to $BASE"
+  else
+    CODE=$(curl "$@" "$BASE$path") || fail "$method $path: curl could not complete the request to $BASE"
   fi
-  CODE=$(curl "$@" "$BASE$path") || fail "$method $path: curl could not complete the request to $BASE"
 }
 
 # check STEP WANT_CODE METHOD PATH [JSON_BODY]; WANT_CODE may list alternatives: "202|200".
