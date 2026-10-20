@@ -31,6 +31,7 @@ func NewRouter(d Deps) http.Handler {
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", d.healthz)
+	mux.HandleFunc("POST /api/syncs", d.startSync)
 	return d.requestLog(mux)
 }
 

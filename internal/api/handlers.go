@@ -30,6 +30,10 @@ var uuidPattern = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]
 
 func isUUID(s string) bool { return uuidPattern.MatchString(s) }
 
+// idPattern is the shape of the supplier and update ids a client may send. Go's $ matches
+// only at the very end of the text, so a trailing newline does not slip through.
+var idPattern = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
+
 // writeJSON encodes before writing, so a value that cannot be encoded produces a clean 500
 // instead of a truncated 200.
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -119,6 +123,146 @@ func parsePage(q url.Values) (limit, offset int, err error) {
 		}
 	}
 	return limit, offset, nil
+}
+
+// writeValidation answers 422 for a well-formed request whose values are not acceptable.
+func writeValidation(w http.ResponseWriter, message string) {
+	writeError(w, http.StatusUnprocessableEntity, "VALIDATION_FAILED", message, nil)
+}
+
+// requireManager answers 500 and reports false when the router was built without a Manager.
+// That is a wiring mistake in the process, and it must not turn into a nil dereference
+// inside a request.
+func (d Deps) requireManager(w http.ResponseWriter, r *http.Request) bool {
+	if d.Manager == nil {
+		d.writeFailure(w, r, errors.New("api: sync manager is not configured"), nil)
+		return false
+	}
+	return true
+}
+
+// Response shapes. They are written out field by field so the JSON contract is visible in
+// one place and no database or domain struct ever reaches a client by accident. Timestamps
+// are sent in UTC, whatever zone the database session reports.
+
+type jobView struct {
+	JobID              string         `json:"job_id"`
+	Status             syncjob.Status `json:"status"`
+	SupplierID         string         `json:"supplier_id"`
+	SupplierUpdateID   string         `json:"supplier_update_id"`
+	Progress           progressView   `json:"progress"`
+	Changes            changeTotals   `json:"changes"`
+	Ignored            ignoredTotals  `json:"ignored"`
+	OpenBlockingIssues int            `json:"open_blocking_issues"`
+	LastError          *string        `json:"last_error"`
+	CreatedAt          time.Time      `json:"created_at"`
+	StartedAt          *time.Time     `json:"started_at"`
+	CompletedAt        *time.Time     `json:"completed_at"`
+	UpdatedAt          time.Time      `json:"updated_at"`
+}
+
+type progressView struct {
+	ProcessedBatches int     `json:"processed_batches"`
+	TotalBatches     *int    `json:"total_batches"` // null while the supplier has not said how many
+	NextCursor       string  `json:"next_cursor"`   // "" before the first batch and after the last
+	LastBatchID      *string `json:"last_batch_id"`
+	EndOfFeedSeen    bool    `json:"end_of_feed_seen"`
+}
+
+type changeTotals struct {
+	Created   int `json:"created"`
+	Updated   int `json:"updated"`
+	Withdrawn int `json:"withdrawn"`
+}
+
+type ignoredTotals struct {
+	Duplicate int `json:"duplicate"`
+	Stale     int `json:"stale"`
+}
+
+func newJobView(j syncjob.Job) jobView {
+	return jobView{
+		JobID:            j.ID,
+		Status:           j.Status,
+		SupplierID:       j.SupplierID,
+		SupplierUpdateID: j.UpdateID,
+		Progress: progressView{
+			ProcessedBatches: j.ProcessedBatches,
+			TotalBatches:     j.TotalBatches,
+			NextCursor:       j.NextCursor,
+			LastBatchID:      j.LastBatchID,
+			EndOfFeedSeen:    j.EndOfFeedSeen,
+		},
+		Changes:            changeTotals{Created: j.Created, Updated: j.Updated, Withdrawn: j.Withdrawn},
+		Ignored:            ignoredTotals{Duplicate: j.Duplicate, Stale: j.Stale},
+		OpenBlockingIssues: j.OpenBlockingIssues,
+		LastError:          j.LastError,
+		CreatedAt:          j.CreatedAt.UTC(),
+		StartedAt:          utcPtr(j.StartedAt),
+		CompletedAt:        utcPtr(j.CompletedAt),
+		UpdatedAt:          j.UpdatedAt.UTC(),
+	}
+}
+
+func utcPtr(t *time.Time) *time.Time {
+	if t == nil {
+		return nil
+	}
+	u := t.UTC()
+	return &u
+}
+
+// startRequest is the body of POST /api/syncs.
+type startRequest struct {
+	UpdateID   string  `json:"update_id"`
+	SupplierID *string `json:"supplier_id"` // nil = the configured default supplier
+}
+
+// startSync begins syncing one supplier update. A new update answers 202 and a Location to
+// poll; an update that already has a job answers 200 with that job and does not resume it,
+// so a repeated request is harmless and recovery stays an explicit decision.
+func (d Deps) startSync(w http.ResponseWriter, r *http.Request) {
+	if !d.requireManager(w, r) {
+		return
+	}
+	var req startRequest
+	if err := decodeJSON(w, r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "INVALID_JSON", err.Error(), nil)
+		return
+	}
+	supplierID := d.SupplierID
+	if req.SupplierID != nil {
+		supplierID = *req.SupplierID
+	}
+	switch {
+	case req.UpdateID == "":
+		writeValidation(w, "update_id is required")
+		return
+	case !idPattern.MatchString(req.UpdateID):
+		writeValidation(w, "update_id must be 1-64 characters from A-Z a-z 0-9 . _ -")
+		return
+	case !idPattern.MatchString(supplierID):
+		writeValidation(w, "supplier_id must be 1-64 characters from A-Z a-z 0-9 . _ -")
+		return
+	}
+
+	job, created, err := d.Manager.Start(r.Context(), supplierID, req.UpdateID)
+	switch {
+	case errors.Is(err, syncjob.ErrActiveJobExists):
+		// The active job is empty only when it finished between the conflict and the lookup.
+		var extra map[string]any
+		if job.ID != "" {
+			extra = map[string]any{"active_job_id": job.ID}
+		}
+		d.writeFailure(w, r, err, extra)
+	case err != nil:
+		d.writeFailure(w, r, err, nil)
+	case created:
+		w.Header().Set("Location", "/api/syncs/"+job.ID)
+		writeJSON(w, http.StatusAccepted, newJobView(job))
+	default:
+		writeJSON(w, http.StatusOK, newJobView(job))
+	}
 }
 
 // healthz reports whether the database answers within a second, so an orchestrator can
