@@ -3,8 +3,10 @@ package syncjob
 import (
 	"context"
 	"errors"
+	"math"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -671,6 +673,34 @@ func TestOnlyARetryableDatabaseErrorInterruptsTheJob(t *testing.T) {
 			}
 			if iss := issues[0]; iss.Code != CodeDatabaseError || iss.Severity != tc.wantSeverity || iss.Cursor == nil || *iss.Cursor != "cursor-2" {
 				t.Errorf("issue = %+v, want a %s %s at cursor-2", iss, tc.wantSeverity, CodeDatabaseError)
+			}
+		})
+	}
+}
+
+// total_batches is stored in a 32-bit column. A supplier that announces something outside
+// 1 to MaxInt32 is wrong for good, so the job must say so instead of failing to write the
+// number on every attempt and being offered a resume that cannot help.
+func TestImplausibleAnnouncedBatchCountBlocksTheJobAsInvalid(t *testing.T) {
+	for _, total := range []int{0, -5, math.MaxInt32 + 1, 3_000_000_000} {
+		t.Run(strconv.Itoa(total), func(t *testing.T) {
+			env := mgrSetup(t, Hooks{})
+			info := testutil.Info(mgrUpdate, 3)
+			info.TotalBatches = &total
+			env.sup.SetUpdate(info)
+			job := mgrStart(t, env.m, mgrUpdate)
+			env.m.Wait()
+
+			after := mgrJob(t, env.pool, job.ID)
+			if after.Status != StatusNeedsAttention || after.ProcessedBatches != 0 || after.TotalBatches != nil {
+				t.Fatalf("job = %s, %d batches, total %v; want NEEDS_ATTENTION before any batch and no stored total", after.Status, after.ProcessedBatches, after.TotalBatches)
+			}
+			issues, err := ListIssues(context.Background(), env.pool, job.ID, "", "", 50, 0)
+			if err != nil || len(issues) != 1 {
+				t.Fatalf("issues = %+v, err %v; want exactly one", issues, err)
+			}
+			if iss := issues[0]; iss.Code != CodeInvalidBatch || iss.Severity != SeverityBlocking || !strings.Contains(iss.Message, "announced") {
+				t.Errorf("issue = %+v, want a BLOCKING INVALID_BATCH that names the announced count", iss)
 			}
 		})
 	}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -85,9 +86,11 @@ func (m *Manager) checkUpdate(ctx context.Context, job Job) (stop bool, err erro
 	case info.SupplierID != job.SupplierID:
 		return true, m.blockJob(ctx, job.ID, CodeInvalidBatch, cursor,
 			fmt.Sprintf("update %q belongs to supplier %.80q, but this job syncs supplier %q", job.UpdateID, info.SupplierID, job.SupplierID))
-	case info.TotalBatches != nil && *info.TotalBatches < 1:
+	case info.TotalBatches != nil && (*info.TotalBatches < 1 || *info.TotalBatches > math.MaxInt32):
+		// The upper bound is the width of the total_batches column: a larger number fails to
+		// encode on every attempt, which is the supplier's mistake, not a database outage.
 		return true, m.blockJob(ctx, job.ID, CodeInvalidBatch, cursor,
-			fmt.Sprintf("supplier announced %d batches", *info.TotalBatches))
+			fmt.Sprintf("supplier announced %d batches, expected 1 to %d", *info.TotalBatches, math.MaxInt32))
 	}
 	if err := setTotalBatchesIfUnknown(ctx, m.pool, job.ID, info.TotalBatches); err != nil {
 		return true, m.dbFailure(ctx, job.ID, &cursor, err)
