@@ -3,6 +3,7 @@ package catalog
 import (
 	"errors"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -216,4 +217,103 @@ func TestPayloadHashIsStableHexSHA256(t *testing.T) {
 			t.Fatalf("hash changed between calls: %s vs %s", got, first)
 		}
 	}
+}
+
+// stored builds a stored product row as the repository would return it.
+func stored(status Status, revision int64) *Product {
+	p := &Product{SupplierID: testSupplier, ProductID: "SKU-1", Status: status, Revision: revision}
+	if status == StatusActive {
+		p.Name, p.PriceMinor, p.Currency = ptr("Widget"), ptr(int64(1250)), ptr("USD")
+	}
+	return p
+}
+
+func TestDecideAppliesRevisionRules(t *testing.T) {
+	active := func(rev int64) SupplierProduct { return Canonicalize(activeEvent("SKU-1", rev)) }
+	withdrawn := func(rev int64) SupplierProduct { return Canonicalize(withdrawnEvent("SKU-1", rev)) }
+
+	tests := []struct {
+		name string
+		cur  *Product
+		in   SupplierProduct
+		want Decision
+	}{
+		{"unseen active product is created", nil, active(1), DecisionCreate},
+		{"withdrawal of an unseen product leaves a tombstone", nil, withdrawn(4), DecisionCreateTombstone},
+
+		{"higher active revision updates", stored(StatusActive, 2), active(3), DecisionUpdate},
+		{"lower active revision is stale", stored(StatusActive, 3), active(2), DecisionIgnoreStale},
+		{"identical active revision is a duplicate", stored(StatusActive, 3), active(3), DecisionIgnoreDuplicate},
+		{"same revision with another price conflicts", stored(StatusActive, 3), with(active(3), func(e *SupplierProduct) { e.PriceMinor = ptr(int64(999)) }), DecisionVersionConflict},
+		{"same revision with another name conflicts", stored(StatusActive, 3), with(active(3), func(e *SupplierProduct) { e.Name = ptr("Gadget") }), DecisionVersionConflict},
+		{"same revision with another currency conflicts", stored(StatusActive, 3), with(active(3), func(e *SupplierProduct) { e.Currency = ptr("EUR") }), DecisionVersionConflict},
+
+		{"higher withdrawal withdraws an active product", stored(StatusActive, 2), withdrawn(3), DecisionWithdraw},
+		{"lower withdrawal of an active product is stale", stored(StatusActive, 3), withdrawn(2), DecisionIgnoreStale},
+		{"withdrawal at the stored active revision conflicts", stored(StatusActive, 3), withdrawn(3), DecisionVersionConflict},
+
+		{"lower active revision after a withdrawal is stale", stored(StatusWithdrawn, 3), active(2), DecisionIgnoreStale},
+		{"higher active revision after a withdrawal is blocked", stored(StatusWithdrawn, 3), active(4), DecisionReactivationBlocked},
+		{"active event at the tombstone revision conflicts", stored(StatusWithdrawn, 3), active(3), DecisionVersionConflict},
+		{"repeated withdrawal is a duplicate", stored(StatusWithdrawn, 3), withdrawn(3), DecisionIgnoreDuplicate},
+		{"repeated withdrawal is a duplicate although the tombstone kept its last details", &Product{Status: StatusWithdrawn, Revision: 3, Name: ptr("Widget"), PriceMinor: ptr(int64(1250)), Currency: ptr("USD")}, withdrawn(3), DecisionIgnoreDuplicate},
+		{"higher withdrawal advances the tombstone", stored(StatusWithdrawn, 3), withdrawn(4), DecisionAdvanceTombstone},
+		{"lower withdrawal after a withdrawal is stale", stored(StatusWithdrawn, 3), withdrawn(2), DecisionIgnoreStale},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := Decide(tc.cur, tc.in); got != tc.want {
+				t.Fatalf("Decide = %s, want %s", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestCanonicalSortedOrdersByKeyThenRevision(t *testing.T) {
+	describe := func(evs []SupplierProduct) []string {
+		var out []string
+		for _, e := range evs {
+			out = append(out, e.SupplierID+"/"+e.ProductID+"@"+strconv.FormatInt(e.Revision, 10))
+		}
+		return out
+	}
+	at := func(supplier, product string, rev int64) SupplierProduct {
+		return with(activeEvent(product, rev), func(e *SupplierProduct) { e.SupplierID = supplier })
+	}
+
+	t.Run("out of order revisions of one product", func(t *testing.T) {
+		got := describe(canonicalSorted([]SupplierProduct{activeEvent("A", 5), activeEvent("A", 4)}))
+		if want := []string{"SUP-001/A@4", "SUP-001/A@5"}; !slices.Equal(got, want) {
+			t.Fatalf("order = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("suppliers, then products, then revisions", func(t *testing.T) {
+		in := []SupplierProduct{at("SUP-002", "A", 1), at("SUP-001", "B", 2), at("SUP-001", "B", 1), at("SUP-001", "A", 9)}
+		got := describe(canonicalSorted(in))
+		want := []string{"SUP-001/A@9", "SUP-001/B@1", "SUP-001/B@2", "SUP-002/A@1"}
+		if !slices.Equal(got, want) {
+			t.Fatalf("order = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("equal keys keep the supplier order", func(t *testing.T) {
+		first := with(activeEvent("A", 3), func(e *SupplierProduct) { e.Name = ptr("first") })
+		second := with(activeEvent("A", 3), func(e *SupplierProduct) { e.Name = ptr("second") })
+		got := canonicalSorted([]SupplierProduct{first, second})
+		if *got[0].Name != "first" || *got[1].Name != "second" {
+			t.Fatalf("stable order lost: %q, %q", *got[0].Name, *got[1].Name)
+		}
+	})
+
+	t.Run("canonicalizes without modifying the input", func(t *testing.T) {
+		in := []SupplierProduct{with(activeEvent("A", 1), func(e *SupplierProduct) { e.Name = ptr(" Widget "); e.Currency = ptr("usd") })}
+		got := canonicalSorted(in)
+		if *got[0].Name != "Widget" || *got[0].Currency != "USD" {
+			t.Fatalf("not canonical: %q %q", *got[0].Name, *got[0].Currency)
+		}
+		if *in[0].Name != " Widget " {
+			t.Fatal("input was modified")
+		}
+	})
 }

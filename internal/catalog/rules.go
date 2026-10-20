@@ -1,10 +1,12 @@
 package catalog
 
 import (
+	"cmp"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"unicode/utf8"
@@ -180,4 +182,83 @@ func PayloadHash(p SupplierProduct) string {
 	}
 	sum := sha256.Sum256(raw)
 	return hex.EncodeToString(sum[:])
+}
+
+// Decide says what one canonical incoming event does to the stored row (nil = no row yet).
+// It is pure, so every revision rule can be tested without a database:
+//
+//   - a lower revision is stale and a repeat of the same revision and content is a
+//     duplicate; both are ignored
+//   - the same revision with different content is a conflict that blocks the batch
+//   - a higher revision updates the product, or withdraws it
+//   - WITHDRAWN is terminal: a higher-revision ACTIVE event for a tombstone is blocked
+//     rather than reactivating it, and a higher-revision withdrawal only advances the
+//     tombstone's revision so later stale events are still recognised as stale
+func Decide(cur *Product, in SupplierProduct) Decision {
+	if cur == nil {
+		if in.Status == StatusWithdrawn {
+			return DecisionCreateTombstone
+		}
+		return DecisionCreate
+	}
+	switch {
+	case in.Revision < cur.Revision:
+		return DecisionIgnoreStale
+	case in.Revision == cur.Revision:
+		if samePayload(cur, in) {
+			return DecisionIgnoreDuplicate
+		}
+		return DecisionVersionConflict
+	}
+	// in.Revision > cur.Revision
+	switch {
+	case cur.Status == StatusWithdrawn && in.Status == StatusActive:
+		return DecisionReactivationBlocked
+	case cur.Status == StatusWithdrawn:
+		return DecisionAdvanceTombstone
+	case in.Status == StatusWithdrawn:
+		return DecisionWithdraw
+	default:
+		return DecisionUpdate
+	}
+}
+
+// samePayload compares the fields that give an equal-revision event its meaning. Two
+// withdrawals are the same whatever details they carried; a withdrawal never equals an
+// ACTIVE event.
+func samePayload(cur *Product, in SupplierProduct) bool {
+	if cur.Status != in.Status {
+		return false
+	}
+	if cur.Status == StatusWithdrawn {
+		return true
+	}
+	return equalPtr(cur.Name, in.Name) && equalPtr(cur.PriceMinor, in.PriceMinor) && equalPtr(cur.Currency, in.Currency)
+}
+
+func equalPtr[T comparable](a, b *T) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return *a == *b
+}
+
+// canonicalSorted canonicalizes a batch and orders it by (supplier_id, product_id,
+// revision). Applying events in that order makes the outcome independent of the order
+// the supplier listed them in ([r5, r4] is applied as r4 then r5) and fixes the order in
+// which product rows are locked. The sort is stable so equal events keep the supplier's
+// order. The input slice is left untouched.
+func canonicalSorted(events []SupplierProduct) []SupplierProduct {
+	out := make([]SupplierProduct, len(events))
+	for i, e := range events {
+		out[i] = Canonicalize(e)
+	}
+	slices.SortStableFunc(out, func(a, b SupplierProduct) int {
+		return cmp.Or(
+			strings.Compare(a.SupplierID, b.SupplierID),
+			strings.Compare(a.ProductID, b.ProductID),
+			cmp.Compare(a.Revision, b.Revision),
+		)
+	})
+	return out
 }
