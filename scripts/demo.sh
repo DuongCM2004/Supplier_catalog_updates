@@ -66,6 +66,8 @@ jstr() { printf '%s' "$BODY" | tr -d ' \t\r\n' | { grep -Eo "\"$1\":\"[^\"]*\"" 
 jnum() { printf '%s' "$BODY" | tr -d ' \t\r\n' | { grep -Eo "\"$1\":-?[0-9]+" || true; } | sed -n '1{s/^[^:]*://;p;}'; }
 # Number of times the regex matches in the compacted body (one list item per match).
 jcount() { printf '%s' "$BODY" | tr -d ' \t\r\n' | { grep -Eo "$1" || true; } | wc -l | tr -d ' '; }
+# logval LINE KEY: first "KEY":value of one JSON log line, string quotes dropped, spaces kept.
+logval() { printf '%s' "$1" | { grep -Eo "\"$2\":(\"([^\"\\\\]|\\\\.)*\"|[^,}]*)" || true; } | sed -n '1{s/^[^:]*:"\{0,1\}//;s/"$//;p;}'; }
 
 expect() { # expect WHAT ACTUAL EXPECTED
   [ "$2" = "$3" ] || fail "$1: expected '$3', got '$2'"
@@ -212,6 +214,26 @@ call GET "/api/syncs/$JOB_003/issues?status=OPEN"
 expect "open issue" "$(jstr code)" SUPPLIER_UNAVAILABLE
 expect "open issues" "$(jcount '"code"')" 1
 expect "supplier attempts" "$(jnum retry_count)" 4
+# The retries only exist in the app's logs, and the next step recreates the container (and
+# drops them), so show them now. This container started at the top of this step, so every
+# supplier.retry line here belongs to this outage. The job.interrupted line is written just
+# after the status changes, hence the short wait.
+echo "\$ docker compose logs app | grep -E 'supplier.retry|job.interrupted'"
+deadline=$((SECONDS + 10))
+while :; do
+  LOGS=$(dc logs --no-color app 2>&1)
+  INTERRUPTED=$(grep '"msg":"job.interrupted"' <<<"$LOGS" | grep "\"job_id\":\"$JOB_003\"" || true)
+  [ -z "$INTERRUPTED" ] || break
+  [ "$SECONDS" -lt "$deadline" ] || fail "no job.interrupted event for job $JOB_003 in the app logs"
+  sleep 0.5
+done
+RETRIES=$(grep '"msg":"supplier.retry"' <<<"$LOGS" || true)
+while IFS= read -r line; do
+  [ -n "$line" ] || continue
+  echo "   supplier.retry attempt $(logval "$line" attempt)/$(logval "$line" max_attempts) delay_ms=$(logval "$line" delay_ms) error=$(logval "$line" error)"
+done <<<"$RETRIES"
+sed 's/^[^|]*| /   /' <<<"$INTERRUPTED"
+expect "supplier.retry log lines (RetryMaxAttempts 4 - 1)" "$(grep -c . <<<"$RETRIES" || true)" 3
 call GET /api/products
 expect "active products (the two committed batches are visible)" "$(jcount '"status":"ACTIVE"')" 9
 
