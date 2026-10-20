@@ -15,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/DuongCM2004/resilient-catalog-sync/internal/catalog"
+	"github.com/DuongCM2004/resilient-catalog-sync/internal/storage"
 	"github.com/DuongCM2004/resilient-catalog-sync/internal/supplier"
 )
 
@@ -129,8 +130,22 @@ func (p *Processor) ProcessBatch(ctx context.Context, jobID, requestedCursor str
 	log := p.log.With("job_id", jobID, "update_id", job.UpdateID, "batch_id", b.BatchID, "cursor", requestedCursor)
 
 	out, seq, err := p.apply(ctx, job, requestedCursor, b)
-	if err != nil {
-		return Outcome{}, err
+	var blocking *blockingErr
+	var conflict *catalog.BlockingError
+	switch {
+	case errors.As(err, &blocking):
+		return p.block(ctx, log, jobID, requestedCursor, b.BatchID, blocking.Issue())
+	case errors.As(err, &conflict):
+		return p.block(ctx, log, jobID, requestedCursor, b.BatchID, issueFromCatalog(conflict))
+	case storage.IsDataError(err):
+		// The database refused the data itself (a constraint or trigger): the same batch
+		// would be refused again, so retrying is pointless.
+		return p.block(ctx, log, jobID, requestedCursor, b.BatchID, Issue{
+			Code: CodeDatabaseError, Severity: SeverityBlocking,
+			Message: "the database rejected the batch and rolled it back: " + err.Error(),
+		})
+	case err != nil:
+		return Outcome{}, err // connection-class failure or a simulated crash: the caller decides
 	}
 	switch out.Kind {
 	case KindCommitted:
@@ -143,7 +158,53 @@ func (p *Processor) ProcessBatch(ctx context.Context, jobID, requestedCursor str
 	case KindStale:
 		log.Warn("batch.stale_worker", "reason", "job is no longer waiting for this batch; nothing applied")
 	}
+	if out.Kind == KindCommitted {
+		// Fault point: the batch is durable but the caller has not been told yet.
+		if err := p.hooks.afterCommit(b.BatchID); err != nil {
+			return out, fmt.Errorf("after-commit hook for batch %s: %w", b.BatchID, err)
+		}
+	}
 	return out, nil
+}
+
+// block records why a batch cannot be applied and parks the job for a person to look at.
+// The batch transaction has already rolled back, so the catalog and checkpoint are exactly
+// as before; this separate transaction only adds the issue and moves the job from RUNNING
+// to NEEDS_ATTENTION. If the job is no longer RUNNING (it was interrupted, or another
+// worker got there first) nothing is recorded and the outcome is stale.
+func (p *Processor) block(ctx context.Context, log *slog.Logger, jobID, cursor, batchID string, iss Issue) (Outcome, error) {
+	iss.Cursor = &cursor
+	iss.BatchID = nonEmpty(batchID)
+	_, applied, err := settleJob(ctx, p.pool, jobID, &iss, StatusNeedsAttention, iss.Message)
+	if err != nil {
+		return Outcome{}, fmt.Errorf("record %s issue: %w", iss.Code, err)
+	}
+	if !applied {
+		log.Warn("batch.stale_worker", "reason", "job is no longer RUNNING; blocking issue not recorded", "code", iss.Code)
+		return Outcome{Kind: KindStale}, nil
+	}
+	log.Warn("batch.blocked", "code", iss.Code, "message", iss.Message)
+	log.Info("job.transition", "from", StatusRunning, "to", StatusNeedsAttention, "reason", string(iss.Code))
+	return Outcome{Kind: KindBlocked}, nil
+}
+
+// issueFromCatalog names the offending product in the issue, since the catalog's own
+// message describes only the revisions.
+func issueFromCatalog(e *catalog.BlockingError) Issue {
+	return Issue{
+		Code:       IssueCode(e.Code),
+		Severity:   SeverityBlocking,
+		SupplierID: &e.SupplierID,
+		ProductID:  &e.ProductID,
+		Message:    fmt.Sprintf("%s/%s revision %d: %s", e.SupplierID, e.ProductID, e.Revision, e.Message),
+	}
+}
+
+func nonEmpty(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
 }
 
 // apply runs the checks that need no database, then the batch transaction. A problem that

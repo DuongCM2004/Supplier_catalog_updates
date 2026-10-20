@@ -11,6 +11,7 @@ import (
 	"slices"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/DuongCM2004/resilient-catalog-sync/internal/storage"
 )
@@ -316,4 +317,43 @@ func countOpenBlocking(ctx context.Context, db storage.DB, jobID string) (int, e
 		return 0, fmt.Errorf("count open blocking issues for job %s: %w", jobID, err)
 	}
 	return n, nil
+}
+
+// settleJob ends a worker's run of a job in one transaction under the job lock: it records
+// iss (when not nil) and moves the job from RUNNING to `to`, with lastError as the reason
+// shown to people. A job that is no longer RUNNING (shut down, already settled, resumed
+// elsewhere) is left alone and applied is false, so a late arrival can neither overwrite a
+// newer state nor attach an issue to a job that has moved on. An issue without a cursor gets
+// the job's own next_cursor. prev is the job as it was when locked, for logging.
+func settleJob(ctx context.Context, pool *pgxpool.Pool, jobID string, iss *Issue, to Status, lastError string) (prev Job, applied bool, err error) {
+	err = pgx.BeginFunc(ctx, pool, func(tx pgx.Tx) error {
+		j, err := lockJob(ctx, tx, jobID)
+		if err != nil {
+			return err
+		}
+		prev = j
+		if j.Status != StatusRunning {
+			return nil
+		}
+		if iss != nil {
+			rec := *iss
+			rec.JobID = jobID
+			if rec.Cursor == nil {
+				cursor := j.NextCursor
+				rec.Cursor = &cursor
+			}
+			if err := recordIssue(ctx, tx, rec); err != nil {
+				return err
+			}
+		}
+		if err := transition(ctx, tx, jobID, []Status{StatusRunning}, to, &lastError); err != nil {
+			return err
+		}
+		applied = true
+		return nil
+	})
+	if err != nil {
+		return Job{}, false, err
+	}
+	return prev, applied, nil
 }
