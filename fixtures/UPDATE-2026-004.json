@@ -1,0 +1,38 @@
+{
+  "update_id": "UPDATE-2026-004",
+  "supplier_id": "SUP-001",
+  "total_batches": 3,
+  "description": "The second batch contains a negative price. That whole batch is rejected, the first batch stays committed, and the job waits for the supplier to correct the record.",
+  "requires": [],
+  "expected": { "status": "NEEDS_ATTENTION", "created": 1, "updated": 0, "withdrawn": 0, "duplicate": 0, "stale": 0, "issue": "INVALID_PRODUCT_DATA" },
+  "pages": [
+    {
+      "cursor": "",
+      "batch": {
+        "update_id": "UPDATE-2026-004", "batch_id": "BATCH-001", "next_cursor": "cursor-002", "has_more": true,
+        "products": [
+          { "supplier_id": "SUP-001", "product_id": "SKU-301", "name": "Ceramic Pour-Over Set", "price_minor": 4200, "currency": "USD", "revision": 1, "status": "ACTIVE" }
+        ]
+      }
+    },
+    {
+      "cursor": "cursor-002",
+      "batch": {
+        "update_id": "UPDATE-2026-004", "batch_id": "BATCH-002", "next_cursor": "cursor-003", "has_more": true,
+        "products": [
+          { "supplier_id": "SUP-001", "product_id": "SKU-302", "name": "Glass Kettle", "price_minor": -5, "currency": "USD", "revision": 1, "status": "ACTIVE" },
+          { "supplier_id": "SUP-001", "product_id": "SKU-303", "name": "Coffee Grinder", "price_minor": 5400, "currency": "USD", "revision": 1, "status": "ACTIVE" }
+        ]
+      }
+    },
+    {
+      "cursor": "cursor-003",
+      "batch": {
+        "update_id": "UPDATE-2026-004", "batch_id": "BATCH-003", "next_cursor": "", "has_more": false,
+        "products": [
+          { "supplier_id": "SUP-001", "product_id": "SKU-304", "name": "Paper Filters 100pk", "price_minor": 650, "currency": "USD", "revision": 1, "status": "ACTIVE" }
+        ]
+      }
+    }
+  ]
+}

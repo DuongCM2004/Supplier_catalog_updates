@@ -1,0 +1,60 @@
+{
+  "update_id": "UPDATE-2026-003",
+  "supplier_id": "SUP-001",
+  "total_batches": 5,
+  "description": "Five clean batches of two new products each; used to show a supplier outage after two committed batches and the resume from the saved cursor.",
+  "requires": [],
+  "expected": { "status": "COMPLETED", "created": 10, "updated": 0, "withdrawn": 0, "duplicate": 0, "stale": 0 },
+  "pages": [
+    {
+      "cursor": "",
+      "batch": {
+        "update_id": "UPDATE-2026-003", "batch_id": "BATCH-001", "next_cursor": "cursor-002", "has_more": true,
+        "products": [
+          { "supplier_id": "SUP-001", "product_id": "SKU-201", "name": "Desk Lamp", "price_minor": 4590, "currency": "USD", "revision": 1, "status": "ACTIVE" },
+          { "supplier_id": "SUP-001", "product_id": "SKU-202", "name": "Ergonomic Mouse", "price_minor": 3990, "currency": "USD", "revision": 1, "status": "ACTIVE" }
+        ]
+      }
+    },
+    {
+      "cursor": "cursor-002",
+      "batch": {
+        "update_id": "UPDATE-2026-003", "batch_id": "BATCH-002", "next_cursor": "cursor-003", "has_more": true,
+        "products": [
+          { "supplier_id": "SUP-001", "product_id": "SKU-203", "name": "Mechanical Keyboard", "price_minor": 11900, "currency": "USD", "revision": 1, "status": "ACTIVE" },
+          { "supplier_id": "SUP-001", "product_id": "SKU-204", "name": "Laptop Sleeve 14in", "price_minor": 2790, "currency": "USD", "revision": 1, "status": "ACTIVE" }
+        ]
+      }
+    },
+    {
+      "cursor": "cursor-003",
+      "batch": {
+        "update_id": "UPDATE-2026-003", "batch_id": "BATCH-003", "next_cursor": "cursor-004", "has_more": true,
+        "products": [
+          { "supplier_id": "SUP-001", "product_id": "SKU-205", "name": "Webcam 1080p", "price_minor": 5490, "currency": "USD", "revision": 1, "status": "ACTIVE" },
+          { "supplier_id": "SUP-001", "product_id": "SKU-206", "name": "Noise-Cancelling Headset", "price_minor": 14900, "currency": "USD", "revision": 1, "status": "ACTIVE" }
+        ]
+      }
+    },
+    {
+      "cursor": "cursor-004",
+      "batch": {
+        "update_id": "UPDATE-2026-003", "batch_id": "BATCH-004", "next_cursor": "cursor-005", "has_more": true,
+        "products": [
+          { "supplier_id": "SUP-001", "product_id": "SKU-207", "name": "Monitor Arm", "price_minor": 7290, "currency": "USD", "revision": 1, "status": "ACTIVE" },
+          { "supplier_id": "SUP-001", "product_id": "SKU-208", "name": "Cable Management Kit", "price_minor": 1290, "currency": "USD", "revision": 1, "status": "ACTIVE" }
+        ]
+      }
+    },
+    {
+      "cursor": "cursor-005",
+      "batch": {
+        "update_id": "UPDATE-2026-003", "batch_id": "BATCH-005", "next_cursor": "", "has_more": false,
+        "products": [
+          { "supplier_id": "SUP-001", "product_id": "SKU-209", "name": "Footrest", "price_minor": 3490, "currency": "USD", "revision": 1, "status": "ACTIVE" },
+          { "supplier_id": "SUP-001", "product_id": "SKU-210", "name": "Whiteboard 60x90cm", "price_minor": 6190, "currency": "USD", "revision": 1, "status": "ACTIVE" }
+        ]
+      }
+    }
+  ]
+}

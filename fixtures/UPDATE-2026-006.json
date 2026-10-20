@@ -1,0 +1,20 @@
+{
+  "update_id": "UPDATE-2026-006",
+  "supplier_id": "SUP-001",
+  "total_batches": 1,
+  "description": "SKU-103 is offered ACTIVE at revision 3 although it was withdrawn at revision 2. Withdrawal is terminal, so the whole batch is rejected, including the valid update that would otherwise apply first.",
+  "requires": ["UPDATE-2026-001"],
+  "expected": { "status": "NEEDS_ATTENTION", "created": 0, "updated": 0, "withdrawn": 0, "duplicate": 0, "stale": 0, "issue": "REACTIVATION_BLOCKED" },
+  "pages": [
+    {
+      "cursor": "",
+      "batch": {
+        "update_id": "UPDATE-2026-006", "batch_id": "BATCH-001", "next_cursor": "", "has_more": false,
+        "products": [
+          { "supplier_id": "SUP-001", "product_id": "SKU-103", "name": "Camping Lantern", "price_minor": 3500, "currency": "USD", "revision": 3, "status": "ACTIVE" },
+          { "supplier_id": "SUP-001", "product_id": "SKU-102", "name": "Steel Water Bottle 750ml", "price_minor": 2750, "currency": "USD", "revision": 3, "status": "ACTIVE" }
+        ]
+      }
+    }
+  ]
+}

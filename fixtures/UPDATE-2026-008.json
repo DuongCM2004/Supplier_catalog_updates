@@ -1,0 +1,20 @@
+{
+  "update_id": "UPDATE-2026-008",
+  "supplier_id": "SUP-001",
+  "total_batches": 2,
+  "description": "The first page says more data follows at cursor-002, but the supplier has no such page. The job must stop instead of guessing the feed is finished.",
+  "requires": [],
+  "expected": { "status": "NEEDS_ATTENTION", "created": 2, "updated": 0, "withdrawn": 0, "duplicate": 0, "stale": 0, "issue": "INVALID_CURSOR" },
+  "pages": [
+    {
+      "cursor": "",
+      "batch": {
+        "update_id": "UPDATE-2026-008", "batch_id": "BATCH-001", "next_cursor": "cursor-002", "has_more": true,
+        "products": [
+          { "supplier_id": "SUP-001", "product_id": "SKU-601", "name": "Oak Cutting Board", "price_minor": 4500, "currency": "USD", "revision": 1, "status": "ACTIVE" },
+          { "supplier_id": "SUP-001", "product_id": "SKU-602", "name": "Chef Knife 20cm", "price_minor": 7900, "currency": "USD", "revision": 1, "status": "ACTIVE" }
+        ]
+      }
+    }
+  ]
+}

@@ -1,0 +1,20 @@
+{
+  "update_id": "UPDATE-2026-005",
+  "supplier_id": "SUP-001",
+  "total_batches": 1,
+  "description": "SKU-101 revision 2 arrives again with a different price than the stored revision 2. The supplier contradicts itself, so the whole batch is rejected, including the new product that would otherwise apply first.",
+  "requires": ["UPDATE-2026-001"],
+  "expected": { "status": "NEEDS_ATTENTION", "created": 0, "updated": 0, "withdrawn": 0, "duplicate": 0, "stale": 0, "issue": "VERSION_CONFLICT" },
+  "pages": [
+    {
+      "cursor": "",
+      "batch": {
+        "update_id": "UPDATE-2026-005", "batch_id": "BATCH-001", "next_cursor": "", "has_more": false,
+        "products": [
+          { "supplier_id": "SUP-001", "product_id": "SKU-101", "name": "Trail Backpack 30L", "price_minor": 9990, "currency": "USD", "revision": 2, "status": "ACTIVE" },
+          { "supplier_id": "SUP-001", "product_id": "SKU-100", "name": "Trail Backpack 20L", "price_minor": 7490, "currency": "USD", "revision": 1, "status": "ACTIVE" }
+        ]
+      }
+    }
+  ]
+}

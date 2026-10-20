@@ -3,6 +3,11 @@
 /server
 *.exe
 
+# Test coverage output
+coverage.out
+coverage.html
+*.coverprofile
+
 # Project-local Go toolchain, module and build caches (see .tools/activate.sh)
 .tools/
 
