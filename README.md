@@ -86,7 +86,7 @@ Set `APP_PORT` (API) and `DB_PORT` (PostgreSQL) in `.env`, or for one command on
 
 ```bash
 APP_PORT=18088 DB_PORT=55433 docker compose up --build        # bash
-$env:APP_PORT = 18088; $env:DB_PORT = 55433; docker compose up --build   # PowerShell
+$env:APP_PORT = 18088; $env:DB_PORT = 55432; docker compose up --build   # PowerShell
 ```
 
 A variable set in your shell wins over `.env`. To run a second, isolated stack next to the
