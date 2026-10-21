@@ -2,7 +2,7 @@
 # Apply it from the Render dashboard (New > Blueprint); README section "Deploy to Render".
 services:
   - type: web
-    name: resilient-catalog-sync
+    name: supplier-catalog-updates
     runtime: docker
     plan: free
     healthCheckPath: /healthz
@@ -11,7 +11,7 @@ services:
       # that Render injects, so HTTP_ADDR is deliberately not set.
       - key: DATABASE_URL
         fromDatabase:
-          name: resilient-catalog-db
+          name: supplier-catalog-db
           property: connectionString
       # Render generates the secret on first deploy; POST routes require it as a bearer token.
       - key: API_TOKEN
@@ -20,7 +20,7 @@ services:
         value: SUP-001
 
 databases:
-  - name: resilient-catalog-db
+  - name: supplier-catalog-db
     plan: free
     postgresMajorVersion: "17"
     # Only the web service (private network) may connect; no external access.
