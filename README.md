@@ -20,7 +20,7 @@ flowchart TB
   subgraph app["Go service (single instance)"]
     api["api: routes and handlers<br/>request log"]
     mgr["syncjob.Manager<br/>start, resume, reconcile, shutdown"]
-    wrk["worker: one goroutine per running job<br/>bounded retry with backoff"]
+    wrk["worker: one routine per running job<br/>bounded retry with backoff"]
     prc["Processor<br/>one transaction per batch"]
     cat["catalog<br/>validate, revision rules, apply"]
     sup["supplier: fixture client<br/>demo failure switches"]
