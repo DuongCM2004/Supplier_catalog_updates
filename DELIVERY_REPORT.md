@@ -1,8 +1,8 @@
 # Delivery report — Resilient Supplier Catalog Sync
 
-Status: **all automated work done and verified; author actions pending** (publishing the
-repository, Render deployment, demo video). Nothing below is claimed unless a command in this
-repository produced it.
+Status: **all automated work done and verified; repository published; author actions pending**
+(Render deployment, demo video). Repository: https://github.com/DuongCM2004/Supplier_catalog_updates.
+Nothing below is claimed unless a command in this repository produced it.
 
 ## 1. Timeline
 
@@ -18,6 +18,7 @@ repository produced it.
 | 2026-10-21 00:13 | Review fixes merged, each with a test that fails without it |
 | 00:37 | Verification: two consecutive full runs, race run, smoke, demo — all green |
 | 00:55–01:05 | Pre-publish checks: hygiene scan clean, clean clone green |
+| 16:36 | Repository published as public `DuongCM2004/Supplier_catalog_updates`; `main` pushed |
 
 ## 2. Requirements
 
@@ -79,8 +80,8 @@ coverage measured during review: 76.6–97.0 %.
 
 | Item | Owner | Next step |
 |---|---|---|
-| Publish the public repository | author | say "publish": the agent creates `DuongCM2004/resilient-catalog-sync`, pushes `main`, verifies with `gh repo view` |
-| Render deployment | author | after publishing: Render dashboard → New → Blueprint → this repository → Deploy Blueprint |
+| Publish the public repository | author | DONE 2026-10-21 16:36: https://github.com/DuongCM2004/Supplier_catalog_updates is public; remote `main` matched local `main` (`gh repo view`, `git ls-remote`) |
+| Render deployment | author | Render dashboard → New → Blueprint → `Supplier_catalog_updates` → Deploy Blueprint |
 | Deployed check | agent + author | `bash scripts/remote-check.sh <url>` (public steps), then once with `API_TOKEN` exported |
 | Demo video (3–5 min) | author | record `DEMO_PAUSE=3 bash scripts/demo.sh` on a fresh `rcs-demo` project |
 | README section 8 links | agent | insert the real repository, video and Render URLs once they exist |
