@@ -85,7 +85,7 @@ internally.
 Set `APP_PORT` (API) and `DB_PORT` (PostgreSQL) in `.env`, or for one command only:
 
 ```bash
-APP_PORT=18088 DB_PORT=55433 docker compose up --build        # bash
+APP_PORT=18088 DB_PORT=55432 docker compose up --build        # bash
 $env:APP_PORT = 18088; $env:DB_PORT = 55432; docker compose up --build   # PowerShell
 ```
 
